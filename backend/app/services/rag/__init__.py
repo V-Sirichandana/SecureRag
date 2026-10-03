@@ -126,21 +126,30 @@ def get_reranker(settings: Settings) -> Reranker:
     return provider()
 
 
-def get_lexical_index(settings: Settings) -> LexicalIndex:
-    """Build the configured lexical index.
+def get_lexical_index(settings: Settings, db=None) -> LexicalIndex:
+    """Build the lexical index for the current call site (Option A).
 
-    No real lexical provider exists yet, so every configuration explicitly
-    resolves to :class:`~app.services.rag.lexical.NullLexicalIndex` (returns
-    no candidates, never writes). This is not a fallback: when the real
-    provider lands it is selected here by configuration, and an unknown
-    provider keeps raising SERVICE_NOT_CONFIGURED (501) rather than
-    degrading to the null index. Dialect detection is deliberately deferred
-    (milestone 2); ``settings`` is already part of the signature so call
-    sites stay unchanged.
+    * ``db`` supplied → :class:`~app.services.rag.lexical.SqlLexicalIndex`,
+      a persistent, tenant-scoped store on the caller's own session. Its
+      writes are flush-only: the caller owns commit/rollback (milestone 2 —
+      storage only; retrieval stays vector-only).
+    * no ``db`` → :class:`~app.services.rag.lexical.NullLexicalIndex`, the
+      explicit no-op for call sites without a session (e.g. the retriever
+      factory). This is an explicit absence of storage, not a silent
+      fallback from a configured provider.
+
+    The dialect (PostgreSQL GIN vs SQLite FTS5 mirror) is detected from the
+    session itself; no extra provider setting exists. ``settings`` stays in
+    the signature for call-site compatibility and future configuration.
     """
-    from app.services.rag.lexical import NullLexicalIndex
+    if db is None:
+        from app.services.rag.lexical import NullLexicalIndex
 
-    return NullLexicalIndex()
+        return NullLexicalIndex()
+
+    from app.services.rag.lexical import SqlLexicalIndex
+
+    return SqlLexicalIndex(db)
 
 
 def get_llm_provider(settings: Settings) -> LLMProvider:

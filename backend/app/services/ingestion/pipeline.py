@@ -1,12 +1,17 @@
-"""The ingestion pipeline: bytes → text → chunks → embeddings → Qdrant.
+"""The ingestion pipeline: bytes → text → chunks → embeddings → indexes.
 
-    upload → validate → extract → normalize → chunk → embed → upsert
-                                           → document status updated by caller
+    upload → validate → extract → normalize → chunk → embed → payloads
+           → lexical.replace_document → Qdrant delete → Qdrant upsert
+                                   → document status updated by caller
 
-The pipeline is deliberately free of database access: it receives the
-server-derived ``tenant_id`` and returns counts, while the calling
+The pipeline owns no database session and no status transition: it receives
+the server-derived ``tenant_id`` and returns counts, while the calling
 ``DocumentService`` owns the document status transition (processing →
-ready / failed) and the audit trail.
+ready / failed) and the audit trail. Lexical rows are written through the
+:class:`~app.services.rag.base.LexicalIndex` seam using the caller's own
+session (flush-only), so the caller's commit/rollback decides whether they
+become durable — a Qdrant failure after the lexical write is rolled back
+together with any staged rows.
 """
 
 from __future__ import annotations
@@ -18,7 +23,12 @@ from app.core.config import Settings
 from app.core.exceptions import AppError
 from app.services.ingestion.chunker import Chunk, ChunkingService
 from app.services.ingestion.processor import FileDocumentProcessor
-from app.services.rag.base import DocumentProcessor, EmbeddingService, VectorStore
+from app.services.rag.base import (
+    DocumentProcessor,
+    EmbeddingService,
+    LexicalIndex,
+    VectorStore,
+)
 
 
 @dataclass(frozen=True)
@@ -35,14 +45,18 @@ class IngestionPipeline:
         chunker: ChunkingService,
         embedder: EmbeddingService,
         vector_store: VectorStore,
+        lexical_index: LexicalIndex,
     ) -> None:
         self.processor = processor
         self.chunker = chunker
         self.embedder = embedder
         self.vector_store = vector_store
+        self.lexical_index = lexical_index
 
     @classmethod
-    def build(cls, settings: Settings, vector_store: VectorStore) -> IngestionPipeline:
+    def build(
+        cls, settings: Settings, vector_store: VectorStore, lexical_index: LexicalIndex
+    ) -> IngestionPipeline:
         """Wire the pipeline from configuration (provider stays swappable)."""
         from app.services.rag import get_embedding_service  # local: avoid import cycle
 
@@ -53,6 +67,7 @@ class IngestionPipeline:
             ),
             embedder=get_embedding_service(settings),
             vector_store=vector_store,
+            lexical_index=lexical_index,
         )
 
     # ------------------------------------------------------------------ runs
@@ -90,6 +105,12 @@ class IngestionPipeline:
             for chunk in chunks
         ]
 
+        # lexical FIRST — a lexical failure aborts before any Qdrant mutation;
+        # a later Qdrant failure is undone by the caller's rollback, which
+        # also discards these flush-only lexical rows
+        await self.lexical_index.replace_document(
+            tenant_id=tenant_id, document_id=document_id, payloads=payloads
+        )
         # replace any previous version of this document (idempotent re-ingest)
         await self.vector_store.delete_document(tenant_id=tenant_id, document_id=document_id)
         await self.vector_store.upsert_chunks(

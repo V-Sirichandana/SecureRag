@@ -85,3 +85,35 @@ class DocumentPermission(Base, UUIDPk, TimestampMixin):
         Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=True
     )
     role: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+
+class DocumentChunk(Base, UUIDPk, TimestampMixin):
+    """One indexed text chunk — canonical storage for lexical retrieval.
+
+    Deliberately stores ONLY retrieval payload fields: no ``created_by``,
+    ``access`` or ``classification`` hints. Authorization always comes from
+    the CURRENT ``documents`` / ``document_permissions`` rows, never from
+    what was true at ingest time. ``tenant_id`` is persisted and indexed so
+    every lexical query can be scoped server-side.
+    """
+
+    __tablename__ = "document_chunks"
+    __table_args__ = (
+        Index("ix_document_chunks_tenant_document", "tenant_id", "document_id"),
+        Index("ix_document_chunks_tenant_collection", "tenant_id", "collection_id"),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    collection_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("collections.id", ondelete="SET NULL"), nullable=True
+    )
+    chunk_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    chunk_index: Mapped[int] = mapped_column(nullable=False)
+    page: Mapped[int] = mapped_column(default=1, nullable=False)
+    filename: Mapped[str] = mapped_column(String(400), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)

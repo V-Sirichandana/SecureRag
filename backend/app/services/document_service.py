@@ -39,7 +39,8 @@ from app.services.ingestion.processor import (
     normalize_file_name,
 )
 from app.services.ingestion.vector_store import UnconfiguredVectorStore
-from app.services.rag.base import VectorStore
+from app.services.rag import get_lexical_index
+from app.services.rag.base import LexicalIndex, VectorStore
 
 logger = logging.getLogger("securerag.ingestion")
 
@@ -74,12 +75,17 @@ class DocumentService:
         *,
         settings: Settings | None = None,
         vector_store: VectorStore | None = None,
+        lexical_index: LexicalIndex | None = None,
     ) -> None:
         self.db = db
         self.repository = DocumentRepository(db)
         self.audit = AuditService(db)
         self.settings = settings or get_settings()
         self.vector_store = vector_store or UnconfiguredVectorStore()
+        # derived, never routed: every upload/re-ingest/delete call site gets
+        # the lexical index without route changes (factory falls back to the
+        # explicit null index only when no session exists)
+        self.lexical_index = lexical_index or get_lexical_index(self.settings, db)
 
     # ---------------------------------------------------------------- helpers
     async def _permissions(self, document_id: uuid.UUID) -> list[DocumentPermission]:
@@ -259,7 +265,7 @@ class DocumentService:
             raise NotFoundError("COLLECTION_NOT_FOUND")
 
         # fail fast on provider misconfiguration BEFORE any database write
-        pipeline = IngestionPipeline.build(self.settings, self.vector_store)
+        pipeline = IngestionPipeline.build(self.settings, self.vector_store, self.lexical_index)
 
         extension = file_extension(file_name) or "txt"
         document = Document(
@@ -312,6 +318,11 @@ class DocumentService:
             ip_address=ip_address,
             user_agent=user_agent,
         )
+        if document.status == "failed":
+            # failure rolled the session back: collection was loaded before
+            # that rollback and async sessions cannot lazy-load expired
+            # attributes (document/user were refreshed inside _run_ingestion)
+            await self.db.refresh(collection)
         return self._serialize(document, user, collection)
 
     async def reingest_document(
@@ -339,7 +350,7 @@ class DocumentService:
         if not self._can_edit(role, user.id, document):
             raise AppError("FORBIDDEN", "You cannot modify this document.", status_code=403)
 
-        pipeline = IngestionPipeline.build(self.settings, self.vector_store)
+        pipeline = IngestionPipeline.build(self.settings, self.vector_store, self.lexical_index)
 
         document.file_name = normalize_file_name(file_name)
         document.file_type = (file_extension(file_name) or "txt")[:16]
@@ -370,6 +381,13 @@ class DocumentService:
             ip_address=ip_address,
             user_agent=user_agent,
         )
+        if document.status == "failed":
+            # failure rolled the session back: refresh instances loaded
+            # before it (document/user were refreshed inside _run_ingestion)
+            if collection is not None:
+                await self.db.refresh(collection)
+            if owner is not None:
+                await self.db.refresh(owner)
         return self._serialize(document, owner, collection)
 
     # -------------------------------------------------------------- ingestion
@@ -418,7 +436,23 @@ class DocumentService:
                 },
             )
         except Exception as exc:  # noqa: BLE001 - failure must never leave a fake "ready"
+            # FIRST operation: discard everything staged since commit #1 — the
+            # flush-only lexical rows (and their removal of a previous version)
+            # must not survive a failed ingestion
+            await self.db.rollback()
             reason = self._safe_reason(exc)
+            # rollback expires loaded instances and an async session cannot
+            # lazy-load them → refresh everything this path still touches
+            await self.db.refresh(document)
+            await self.db.refresh(user)
+            await self.db.refresh(tenant)
+            # rollback restores rows committed by an earlier successful ingest;
+            # delete them so a failed document never leaves stale lexical
+            # content searchable (this DELETE commits together with the
+            # failed status below — deterministic compensation)
+            await self.lexical_index.delete_document(
+                tenant_id=str(tenant.id), document_id=str(document.id)
+            )
             document.status = "failed"
             await self.audit.log(
                 user=user,
@@ -570,6 +604,12 @@ class DocumentService:
         # remove vectors FIRST — if the vector backend fails the request aborts
         # and nothing is half-deleted (and no orphaned vectors are searchable)
         await self.vector_store.delete_document(
+            tenant_id=str(tenant.id), document_id=str(document.id)
+        )
+        # then lexical rows: external stores before the DB row, mirroring the
+        # vector order (the FK cascade on document_chunks is the backstop; the
+        # SQLite FTS5 mirror has no FK and is cleared here)
+        await self.lexical_index.delete_document(
             tenant_id=str(tenant.id), document_id=str(document.id)
         )
 
