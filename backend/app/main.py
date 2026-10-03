@@ -25,6 +25,7 @@ from app.core.exceptions import install_exception_handlers
 from app.core.logging import configure_logging
 from app.db.database import create_engine_and_factory
 from app.middleware.request_context import RequestContextMiddleware
+from app.services.rag import build_vector_store
 from app.services.rate_limit import LoginRateLimiter
 
 logger = logging.getLogger("securerag.app")
@@ -90,6 +91,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.rate_limiter = LoginRateLimiter(settings)
+    # one vector store per app instance (per-tenant isolation is enforced in
+    # the store itself, never by client input) — never raises at startup
+    app.state.vector_store = build_vector_store(settings)
 
     install_exception_handlers(app)
 

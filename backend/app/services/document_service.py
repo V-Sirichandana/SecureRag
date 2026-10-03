@@ -2,16 +2,23 @@
 
 Every query is filtered by ``tenant_id``; a document from another tenant is
 indistinguishable from one that does not exist (404).
+
+The upload/ingest paths additionally run the RAG pipeline (extract → chunk →
+embed → index). The ``tenant_id`` stamped on every vector is the authenticated
+membership's id — never anything sent by the client.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import uuid
+from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings, get_settings
 from app.core.exceptions import AppError, NotFoundError
 from app.core.permissions import Role, role_at_least
 from app.models import Collection, Document, DocumentPermission, Membership, Tenant, User
@@ -25,6 +32,16 @@ from app.schemas.document import (
     DocumentUpdateIn,
 )
 from app.services.audit_service import AuditService
+from app.services.ingestion.pipeline import IngestionPipeline
+from app.services.ingestion.processor import (
+    file_extension,
+    is_supported,
+    normalize_file_name,
+)
+from app.services.ingestion.vector_store import UnconfiguredVectorStore
+from app.services.rag.base import VectorStore
+
+logger = logging.getLogger("securerag.ingestion")
 
 DEFAULT_PAGE_TITLE = "Untitled"
 
@@ -51,10 +68,18 @@ class DocumentService:
                                  (public/internal) documents; edit only their own
     """
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        *,
+        settings: Settings | None = None,
+        vector_store: VectorStore | None = None,
+    ) -> None:
         self.db = db
         self.repository = DocumentRepository(db)
         self.audit = AuditService(db)
+        self.settings = settings or get_settings()
+        self.vector_store = vector_store or UnconfiguredVectorStore()
 
     # ---------------------------------------------------------------- helpers
     async def _permissions(self, document_id: uuid.UUID) -> list[DocumentPermission]:
@@ -213,6 +238,259 @@ class DocumentService:
         await self.db.commit()
         return self._serialize(document, user, collection)
 
+    async def upload_document(
+        self,
+        *,
+        tenant: Tenant,
+        user: User,
+        collection_id: str,
+        classification: str,
+        file_name: str,
+        content: bytes,
+        content_type: str | None = None,
+        ip_address: str | None,
+        user_agent: str | None,
+    ) -> DocumentOut:
+        """Create a document from raw file bytes and index it into the vector store."""
+        self._validate_content(file_name, content, content_type)
+
+        collection = await CollectionRepository(self.db).get(tenant.id, uuid.UUID(collection_id))
+        if collection is None:
+            raise NotFoundError("COLLECTION_NOT_FOUND")
+
+        # fail fast on provider misconfiguration BEFORE any database write
+        pipeline = IngestionPipeline.build(self.settings, self.vector_store)
+
+        extension = file_extension(file_name) or "txt"
+        document = Document(
+            tenant_id=tenant.id,
+            collection_id=collection.id,
+            name=normalize_file_name(file_name),
+            file_name=normalize_file_name(file_name),
+            file_type=extension[:16],
+            file_size=len(content),
+            status="processing",
+            classification=classification,
+            created_by=user.id,
+            page_count=0,
+            chunk_count=0,
+            tags=[],
+        )
+        await self.repository.add(document)
+
+        if classification in ORG_WIDE_CLASSIFICATIONS:
+            # global grant: everyone in the tenant may read this document
+            self.db.add(DocumentPermission(document_id=document.id))
+
+        document.storage_path = self._store_file(tenant.id, document, file_name, content)
+
+        await self.audit.log(
+            user=user,
+            tenant=tenant,
+            action="DOCUMENT_UPLOAD",
+            resource_type="document",
+            resource_id=document.id,
+            resource_label=document.name,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            metadata={
+                "classification": document.classification,
+                "collection": collection.name,
+                "file_type": document.file_type,
+                "size_bytes": document.file_size,
+            },
+        )
+        await self.db.commit()
+
+        await self._run_ingestion(
+            document=document,
+            tenant=tenant,
+            user=user,
+            pipeline=pipeline,
+            file_name=document.file_name,
+            content=content,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+        return self._serialize(document, user, collection)
+
+    async def reingest_document(
+        self,
+        *,
+        tenant: Tenant,
+        user: User,
+        role: Role,
+        document_id: uuid.UUID,
+        file_name: str,
+        content: bytes,
+        content_type: str | None = None,
+        ip_address: str | None,
+        user_agent: str | None,
+    ) -> DocumentOut:
+        """Attach content to an existing (metadata-first) document and index it."""
+        self._validate_content(file_name, content, content_type)
+
+        row = await self.repository.get(tenant.id, document_id)
+        if row is None:
+            raise NotFoundError("DOCUMENT_NOT_FOUND")
+        document, owner, collection = row
+        if not self._can_view(role, user.id, document, await self._permissions(document.id)):
+            raise NotFoundError("DOCUMENT_NOT_FOUND")  # never leak existence
+        if not self._can_edit(role, user.id, document):
+            raise AppError("FORBIDDEN", "You cannot modify this document.", status_code=403)
+
+        pipeline = IngestionPipeline.build(self.settings, self.vector_store)
+
+        document.file_name = normalize_file_name(file_name)
+        document.file_type = (file_extension(file_name) or "txt")[:16]
+        document.file_size = len(content)
+        document.status = "processing"
+        document.storage_path = self._store_file(tenant.id, document, file_name, content)
+
+        await self.audit.log(
+            user=user,
+            tenant=tenant,
+            action="DOCUMENT_UPDATE",
+            resource_type="document",
+            resource_id=document.id,
+            resource_label=document.name,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            metadata={"content": document.file_name, "size_bytes": document.file_size},
+        )
+        await self.db.commit()
+
+        await self._run_ingestion(
+            document=document,
+            tenant=tenant,
+            user=user,
+            pipeline=pipeline,
+            file_name=document.file_name,
+            content=content,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+        return self._serialize(document, owner, collection)
+
+    # -------------------------------------------------------------- ingestion
+    def _validate_content(
+        self, file_name: str, content: bytes, content_type: str | None
+    ) -> None:
+        if not is_supported(file_name, content_type):
+            raise AppError(
+                "UNSUPPORTED_FILE_TYPE",
+                f"'{normalize_file_name(file_name)}' is not a supported format. "
+                "Supported: PDF, DOCX, TXT, MD, CSV, JSON.",
+            )
+        if not content:
+            raise AppError("EMPTY_DOCUMENT", "The uploaded file is empty.")
+        if len(content) > self.settings.max_upload_bytes:
+            raise AppError(
+                "FILE_TOO_LARGE",
+                f"The file exceeds the {self.settings.max_upload_bytes}-byte upload limit.",
+            )
+
+    async def _run_ingestion(
+        self,
+        *,
+        document: Document,
+        tenant: Tenant,
+        user: User,
+        pipeline: IngestionPipeline,
+        file_name: str,
+        content: bytes,
+        ip_address: str | None,
+        user_agent: str | None,
+    ) -> None:
+        """processing → ready (success) or processing → failed (any error)."""
+        try:
+            result = await pipeline.ingest(
+                tenant_id=str(tenant.id),
+                document_id=str(document.id),
+                collection_id=str(document.collection_id) if document.collection_id else None,
+                file_name=file_name,
+                content=content,
+                document_meta={
+                    "name": document.name,
+                    "classification": document.classification,
+                    "created_by": str(document.created_by) if document.created_by else None,
+                    "access": await self._access_scope(document),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - failure must never leave a fake "ready"
+            reason = self._safe_reason(exc)
+            document.status = "failed"
+            await self.audit.log(
+                user=user,
+                tenant=tenant,
+                action="INGESTION_FAILED",
+                resource_type="document",
+                resource_id=document.id,
+                resource_label=document.name,
+                status="failure",
+                ip_address=ip_address,
+                user_agent=user_agent,
+                metadata={"error": reason},
+            )
+            await self.db.commit()
+            logger.warning("Ingestion failed for document %s: %s", document.id, reason)
+            return
+
+        document.status = "ready"
+        document.page_count = result.page_count
+        document.chunk_count = result.chunk_count
+        await self.audit.log(
+            user=user,
+            tenant=tenant,
+            action="DOCUMENT_INDEXED",
+            resource_type="document",
+            resource_id=document.id,
+            resource_label=document.name,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            metadata={"chunks": result.chunk_count, "pages": result.page_count},
+        )
+        await self.db.commit()
+
+    async def _access_scope(self, document: Document) -> str:
+        """Payload metadata for retrieval-time authorization (advisory)."""
+        grants = await self._permissions(document.id)
+        if any(grant.user_id is None and grant.role is None for grant in grants):
+            return "everyone"
+        return "restricted"
+
+    def _store_file(
+        self, tenant_id: uuid.UUID, document: Document, file_name: str, content: bytes
+    ) -> str | None:
+        """Persist raw bytes under a server-generated path (never client paths)."""
+        try:
+            directory = Path(self.settings.storage_dir) / str(tenant_id)
+            directory.mkdir(parents=True, exist_ok=True)
+            suffix = file_extension(file_name)
+            target = directory / f"{document.id}{f'.{suffix}' if suffix else ''}"
+            target.write_bytes(content)
+            return str(target)
+        except OSError:
+            logger.warning("Could not persist upload for document %s", document.id)
+            return None
+
+    def _safe_reason(self, exc: Exception) -> str:
+        """Short, secret-free failure reason for the audit trail."""
+        reason = str(exc) or type(exc).__name__
+        reason = re.sub(r"\s+", " ", reason)[:300]
+        api_key = self.settings.qdrant_api_key
+        if api_key and api_key in reason:
+            reason = reason.replace(api_key, "***")
+        return reason
+
+    async def _remove_stored_file(self, document: Document) -> None:
+        if not document.storage_path:
+            return
+        try:
+            Path(document.storage_path).unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove stored file for document %s", document.id)
+
     async def update_document(
         self,
         *,
@@ -289,6 +567,12 @@ class DocumentService:
         if not self._can_edit(role, user.id, document):
             raise AppError("FORBIDDEN", "You cannot delete this document.", status_code=403)
 
+        # remove vectors FIRST — if the vector backend fails the request aborts
+        # and nothing is half-deleted (and no orphaned vectors are searchable)
+        await self.vector_store.delete_document(
+            tenant_id=str(tenant.id), document_id=str(document.id)
+        )
+
         await self.audit.log(
             user=user,
             tenant=tenant,
@@ -302,6 +586,7 @@ class DocumentService:
         )
         await self.repository.delete(document)
         await self.db.commit()
+        await self._remove_stored_file(document)
 
     async def update_permissions(
         self,

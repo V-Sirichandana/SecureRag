@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_JWT_SECRET_WARNING = (
@@ -52,15 +52,41 @@ class Settings(BaseSettings):
     # cors
     cors_origins: str = "http://localhost:3000"
 
-    # rag providers (modular — not wired up yet)
+    # rag providers (modular)
     qdrant_url: str = ""
     qdrant_api_key: str = ""
+    qdrant_collection: str = "securerag"
+    embedding_provider: str = "hashing"
+    embedding_model: str = ""
+    embedding_dim: int = Field(default=384, ge=8)
+    chunk_size: int = Field(default=800, ge=100)
+    chunk_overlap: int = Field(default=120, ge=0)
+    storage_dir: str = "data/uploads"
+    max_upload_bytes: int = Field(default=10 * 1024 * 1024, ge=1024)
     llm_provider: str = ""
     llm_api_key: str = ""
+
+    # reranker
+    reranker_provider: str = "heuristic"
+    reranker_model: str = ""
+    reranker_top_k: int = Field(default=5, ge=1)
+    reranker_max_candidates: int = Field(default=40, ge=1)
 
     # rate limiting
     rate_limit_login_attempts: int = Field(default=5, ge=1)
     rate_limit_login_window_seconds: int = Field(default=60, ge=1)
+
+    @model_validator(mode="after")
+    def _validate_chunking(self) -> Settings:
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError("CHUNK_OVERLAP must be smaller than CHUNK_SIZE")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_reranker(self) -> Settings:
+        if self.reranker_top_k > self.reranker_max_candidates:
+            raise ValueError("RERANKER_TOP_K must not exceed RERANKER_MAX_CANDIDATES")
+        return self
 
     @field_validator("cookie_samesite")
     @classmethod

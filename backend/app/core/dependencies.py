@@ -28,6 +28,7 @@ from app.core.permissions import Role, has_permission, role_at_least
 from app.core.security import ACCESS_TOKEN_TYPE, decode_token
 from app.models import Membership, Tenant, User
 from app.repositories import UserRepository
+from app.services.rag.base import VectorStore
 
 ACCESS_COOKIE = "sr_access_token"
 REFRESH_COOKIE = "sr_refresh_token"
@@ -65,8 +66,14 @@ def get_app_settings(request: Request) -> Settings:
     return request.app.state.settings
 
 
+def get_app_vector_store(request: Request) -> VectorStore:
+    """Vector backend bound to this app instance (see ``create_app``)."""
+    return request.app.state.vector_store
+
+
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 AppSettings = Annotated[Settings, Depends(get_app_settings)]
+VectorStoreDep = Annotated[VectorStore, Depends(get_app_vector_store)]
 
 
 # ---------------------------------------------------------------------- tokens

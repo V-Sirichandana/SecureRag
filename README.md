@@ -255,6 +255,21 @@ alembic upgrade head
 python -m uvicorn app.main:app --reload --port 8000
 ```
 
+### Start Qdrant (vector database)
+
+Document ingestion (upload → chunks → embeddings → indexing) needs a Qdrant
+instance. From the repository root:
+
+```bash
+docker compose up -d qdrant
+```
+
+Then set `QDRANT_URL=http://localhost:6333` in `backend/.env` (already the
+default in `.env.example`). For a quick, dependency-free local run you can
+instead set `QDRANT_URL=:memory:` (embedded, data lost on restart — tests use
+this too). Uploads without any `QDRANT_URL` are marked `failed` rather than
+silently "ready".
+
 ### Run quality checks
 
 Frontend:

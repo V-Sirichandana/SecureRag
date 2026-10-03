@@ -5,17 +5,20 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request, Response, status
+from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile, status
 
 from app.core.dependencies import (
+    AppSettings,
     CurrentMembership,
     CurrentTenant,
     CurrentUser,
     DbSession,
+    VectorStoreDep,
     client_context,
     require_permission,
 )
 from app.schemas.document import (
+    ClassificationLiteral,
     DocumentCreateIn,
     DocumentOut,
     DocumentPageOut,
@@ -93,6 +96,74 @@ async def create_document(
     )
 
 
+@documents_router.post(
+    "/upload",
+    response_model=DocumentOut,
+    status_code=201,
+    summary="Upload a file and index it for semantic search",
+    dependencies=[Depends(require_permission("upload_documents"))],
+)
+async def upload_document(
+    request: Request,
+    file: Annotated[UploadFile, File(description="PDF, DOCX, TXT, MD, CSV or JSON")],
+    collection_id: Annotated[str, Form()],
+    tenant: CurrentTenant,
+    user: CurrentUser,
+    db: DbSession,
+    settings: AppSettings,
+    vector_store: VectorStoreDep,
+    classification: Annotated[ClassificationLiteral, Form()] = "internal",
+) -> DocumentOut:
+    ip_address, user_agent = client_context(request)
+    # bounded read: never buffer more than the configured limit
+    content = await file.read(settings.max_upload_bytes + 1)
+    return await DocumentService(db, settings=settings, vector_store=vector_store).upload_document(
+        tenant=tenant,
+        user=user,
+        collection_id=collection_id,
+        classification=classification,
+        file_name=file.filename or "",
+        content=content,
+        content_type=file.content_type,
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
+
+
+@documents_router.post(
+    "/{document_id}/content",
+    response_model=DocumentOut,
+    summary="Attach file content to an existing document and index it",
+    dependencies=[Depends(require_permission("upload_documents"))],
+)
+async def upload_document_content(
+    document_id: UUID,
+    request: Request,
+    file: Annotated[UploadFile, File(description="PDF, DOCX, TXT, MD, CSV or JSON")],
+    tenant: CurrentTenant,
+    user: CurrentUser,
+    membership: CurrentMembership,
+    db: DbSession,
+    settings: AppSettings,
+    vector_store: VectorStoreDep,
+) -> DocumentOut:
+    ip_address, user_agent = client_context(request)
+    content = await file.read(settings.max_upload_bytes + 1)
+    return await DocumentService(
+        db, settings=settings, vector_store=vector_store
+    ).reingest_document(
+        tenant=tenant,
+        user=user,
+        role=membership.role,
+        document_id=document_id,
+        file_name=file.filename or "",
+        content=content,
+        content_type=file.content_type,
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
+
+
 @documents_router.get("/{document_id}", response_model=DocumentOut, summary="Fetch a document")
 async def get_document(
     document_id: UUID,
@@ -145,9 +216,10 @@ async def delete_document(
     user: CurrentUser,
     membership: CurrentMembership,
     db: DbSession,
+    vector_store: VectorStoreDep,
 ) -> Response:
     ip_address, user_agent = client_context(request)
-    await DocumentService(db).delete_document(
+    await DocumentService(db, vector_store=vector_store).delete_document(
         tenant=tenant,
         user=user,
         role=membership.role,
