@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     reranker_top_k: int = Field(default=5, ge=1)
     reranker_max_candidates: int = Field(default=40, ge=1)
 
+    # retrieval mode (server-side only — never accepted from clients)
+    retrieval_mode: str = "vector"
+
     # rate limiting
     rate_limit_login_attempts: int = Field(default=5, ge=1)
     rate_limit_login_window_seconds: int = Field(default=60, ge=1)
@@ -94,6 +97,14 @@ class Settings(BaseSettings):
         normalized = value.lower()
         if normalized not in {"lax", "strict", "none"}:
             raise ValueError("cookie_samesite must be lax, strict or none")
+        return normalized
+
+    @field_validator("retrieval_mode")
+    @classmethod
+    def _validate_retrieval_mode(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"vector", "hybrid"}:
+            raise ValueError("RETRIEVAL_MODE must be vector or hybrid")
         return normalized
 
     @property

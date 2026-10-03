@@ -60,3 +60,31 @@ def test_factory_rejects_unknown_provider():
         get_reranker(settings)
     assert excinfo.value.status_code == 501
     assert "does-not-exist" in str(excinfo.value)
+
+
+# ------------------------------------------------------------- retrieval mode
+def test_retrieval_mode_defaults_to_vector():
+    settings = Settings(_env_file=None)
+    assert settings.retrieval_mode == "vector"
+
+
+def test_retrieval_mode_accepts_vector():
+    settings = Settings(retrieval_mode="vector")
+    assert settings.retrieval_mode == "vector"
+
+
+def test_retrieval_mode_accepts_hybrid():
+    settings = Settings(retrieval_mode="hybrid")
+    assert settings.retrieval_mode == "hybrid"
+
+
+def test_retrieval_mode_is_normalized():
+    settings = Settings(retrieval_mode="Hybrid")
+    assert settings.retrieval_mode == "hybrid"
+
+
+@pytest.mark.parametrize("mode", ["bm25", "lexical", "anything"])
+def test_invalid_retrieval_mode_rejected(mode):
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(retrieval_mode=mode)
+    assert "RETRIEVAL_MODE must be vector or hybrid" in str(excinfo.value)

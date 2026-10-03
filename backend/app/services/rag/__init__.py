@@ -13,6 +13,7 @@ from app.core.exceptions import ServiceNotConfiguredError
 from app.services.rag.base import (
     DocumentProcessor,
     EmbeddingService,
+    LexicalIndex,
     LLMProvider,
     Reranker,
     Retriever,
@@ -88,7 +89,8 @@ def get_retriever(
     settings (raises SERVICE_NOT_CONFIGURED if QDRANT_URL is empty). The
     configured reranker is resolved here through :func:`get_reranker` — an
     unknown ``RERANKER_PROVIDER`` raises SERVICE_NOT_CONFIGURED (501) with no
-    fallback to another provider.
+    fallback to another provider. The lexical index is injected through
+    :func:`get_lexical_index` but is not consulted by retrieval yet.
     """
     from app.services.rag.retriever import TenantScopedRetriever
 
@@ -100,6 +102,7 @@ def get_retriever(
         reranker=get_reranker(settings),
         rerank_top_k=settings.reranker_top_k,
         rerank_max_candidates=settings.reranker_max_candidates,
+        lexical_index=get_lexical_index(settings),
     )
 
 
@@ -123,6 +126,23 @@ def get_reranker(settings: Settings) -> Reranker:
     return provider()
 
 
+def get_lexical_index(settings: Settings) -> LexicalIndex:
+    """Build the configured lexical index.
+
+    No real lexical provider exists yet, so every configuration explicitly
+    resolves to :class:`~app.services.rag.lexical.NullLexicalIndex` (returns
+    no candidates, never writes). This is not a fallback: when the real
+    provider lands it is selected here by configuration, and an unknown
+    provider keeps raising SERVICE_NOT_CONFIGURED (501) rather than
+    degrading to the null index. Dialect detection is deliberately deferred
+    (milestone 2); ``settings`` is already part of the signature so call
+    sites stay unchanged.
+    """
+    from app.services.rag.lexical import NullLexicalIndex
+
+    return NullLexicalIndex()
+
+
 def get_llm_provider(settings: Settings) -> LLMProvider:
     if not settings.llm_provider:
         raise ServiceNotConfiguredError("SERVICE_NOT_CONFIGURED", "LLM_PROVIDER is not set.")
@@ -138,6 +158,7 @@ def get_llm_provider(settings: Settings) -> LLMProvider:
 __all__ = [
     "DocumentProcessor",
     "EmbeddingService",
+    "LexicalIndex",
     "LLMProvider",
     "Reranker",
     "Retriever",
@@ -145,6 +166,7 @@ __all__ = [
     "build_vector_store",
     "get_document_processor",
     "get_embedding_service",
+    "get_lexical_index",
     "get_llm_provider",
     "get_reranker",
     "get_retriever",

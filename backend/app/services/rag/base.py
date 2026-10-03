@@ -101,6 +101,54 @@ class VectorStore(Protocol):
 
 
 @runtime_checkable
+class LexicalIndex(Protocol):
+    """Tenant-scoped lexical (keyword) retrieval seam.
+
+    The future BM25-style backend implements this protocol; until one is
+    configured, the factory resolves the explicit no-op provider. Contracts
+    mirror :class:`VectorStore`: ``tenant_id`` always comes from the
+    authenticated principal and must be applied server-side, and ingestion
+    replaces a document's records atomically so re-ingests never leave
+    stale content searchable.
+    """
+
+    async def search(
+        self,
+        *,
+        query: str,
+        tenant_id: str,
+        collection_ids: list[str] | None = None,
+        top_k: int = 8,
+    ) -> list[RetrievedChunk]:
+        """Tenant-scoped lexical search returning no more than ``top_k`` hits.
+
+        ``tenant_id`` comes from the authenticated principal and is always
+        applied server-side. Raw engine scores are implementation detail —
+        callers merge by rank, never by raw score.
+        """
+        ...
+
+    async def replace_document(
+        self,
+        *,
+        tenant_id: str,
+        document_id: str,
+        payloads: list[dict[str, Any]],
+    ) -> None:
+        """Replace every lexical record of one document (idempotent re-ingest).
+
+        ``payloads`` carries the same field names the ingestion pipeline
+        already writes to the vector store (``chunk_id``, ``text``, ``page``,
+        ``chunk_index``, ``filename``, ...) so both indexes stay aligned.
+        """
+        ...
+
+    async def delete_document(self, *, tenant_id: str, document_id: str) -> None:
+        """Remove every lexical record belonging to one document inside one tenant."""
+        ...
+
+
+@runtime_checkable
 class Retriever(Protocol):
     async def retrieve(
         self,

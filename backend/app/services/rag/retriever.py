@@ -32,7 +32,13 @@ from app.core.exceptions import AppError, AuthorizationError
 from app.core.permissions import Role, role_at_least
 from app.models import Document
 from app.repositories import DocumentRepository, UserRepository
-from app.services.rag.base import EmbeddingService, Reranker, RetrievedChunk, VectorStore
+from app.services.rag.base import (
+    EmbeddingService,
+    LexicalIndex,
+    Reranker,
+    RetrievedChunk,
+    VectorStore,
+)
 
 logger = logging.getLogger("securerag.retrieval")
 
@@ -52,7 +58,9 @@ class TenantScopedRetriever:
     session and — optionally — a reranker. ``tenant_id`` / ``user_id`` are
     passed in by the caller from the authenticated principal. The reranker is
     a pure re-ordering step applied AFTER authorization; it never sees and
-    never influences which documents the caller is allowed to read.
+    never influences which documents the caller is allowed to read. An
+    optional lexical index may be injected but is not consulted yet —
+    retrieval stays vector-only until the hybrid merge.
     """
 
     def __init__(
@@ -64,6 +72,7 @@ class TenantScopedRetriever:
         reranker: Reranker | None = None,
         rerank_top_k: int = DEFAULT_TOP_K,
         rerank_max_candidates: int | None = None,
+        lexical_index: LexicalIndex | None = None,
     ) -> None:
         self.db = db
         self.embedder = embedder
@@ -71,6 +80,9 @@ class TenantScopedRetriever:
         self.reranker = reranker
         self.rerank_top_k = rerank_top_k
         self.rerank_max_candidates = rerank_max_candidates
+        # dependency-injection seam only: deliberately never read here, so
+        # lexical search cannot influence results before the hybrid merge
+        self.lexical_index = lexical_index
 
     async def retrieve(
         self,
