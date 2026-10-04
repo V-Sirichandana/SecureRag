@@ -47,6 +47,7 @@ async def invite_user(
     request: Request,
     tenant: CurrentTenant,
     actor: CurrentUser,
+    membership: CurrentMembership,
     db: DbSession,
     settings: AppSettings,
 ) -> InviteUserOut:
@@ -54,6 +55,7 @@ async def invite_user(
     return await UserService(db).invite_user(
         tenant=tenant,
         actor=actor,
+        actor_role=membership.role,
         payload=payload,
         settings=settings,
         ip_address=ip_address,
@@ -99,12 +101,14 @@ async def remove_user(
     request: Request,
     tenant: CurrentTenant,
     actor: CurrentUser,
+    membership: CurrentMembership,
     db: DbSession,
 ) -> Response:
     ip_address, user_agent = client_context(request)
     await UserService(db).remove_user(
         tenant=tenant,
         actor=actor,
+        actor_role=membership.role,
         user_id=user_id,
         ip_address=ip_address,
         user_agent=user_agent,

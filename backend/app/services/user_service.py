@@ -60,19 +60,29 @@ class UserService:
         *,
         tenant: Tenant,
         actor: User,
+        actor_role: Role,
         payload: InviteUserIn,
         settings: Settings,
         ip_address: str | None,
         user_agent: str | None,
     ) -> InviteUserOut:
+        requested_role = Role.from_value(payload.role)
+        # H-1: only owners may hand out the owner role (checked before any write)
+        if requested_role == Role.OWNER and not role_at_least(actor_role, Role.OWNER):
+            raise AppError(
+                "INSUFFICIENT_ROLE",
+                "Only an owner can invite the owner role.",
+                status_code=403,
+            )
         email = payload.email.lower()
         existing = await self.repository.get_by_email(email)
+        setup = existing is None
         if existing is not None:
             if await self.repository.membership(existing.id, tenant.id) is not None:
                 raise ConflictError("EMAIL_EXISTS", "This user is already a member.")
+            # C-1: never mutate the shared account here — deactivating it would
+            # lock the user out of every other organization they belong to.
             user = existing
-            user.status = "invited"
-            user.is_active = False
         else:
             user = await self.repository.add(
                 User(
@@ -87,7 +97,7 @@ class UserService:
             )
 
         membership = await self.repository.add_membership(
-            Membership(tenant_id=tenant.id, user_id=user.id, role=Role.from_value(payload.role))
+            Membership(tenant_id=tenant.id, user_id=user.id, role=requested_role)
         )
         await self.audit.log(
             user=actor,
@@ -103,7 +113,11 @@ class UserService:
         await self.db.commit()
         # Stand-in for email delivery: non-production environments return the
         # acceptance token inline so the flow is usable before SMTP exists.
-        invite_token = None if settings.is_production else create_invite_token(user.id, settings)
+        invite_token = (
+            None
+            if settings.is_production
+            else create_invite_token(user.id, tenant.id, settings, setup=setup)
+        )
         return InviteUserOut.model_validate(
             {**serialize_user(user, membership).model_dump(), "invite_token": invite_token}
         )
@@ -126,6 +140,13 @@ class UserService:
                 status_code=403,
             )
         membership, user = await self.get_membership(tenant=tenant, user_id=user_id)
+        # H-2: owners are immutable to anyone below owner rank
+        if membership.role == Role.OWNER and not role_at_least(actor_role, Role.OWNER):
+            raise AppError(
+                "INSUFFICIENT_ROLE",
+                "Only an owner can modify another owner.",
+                status_code=403,
+            )
         metadata: dict[str, str] = {}
 
         if payload.role is not None:
@@ -168,6 +189,7 @@ class UserService:
         *,
         tenant: Tenant,
         actor: User,
+        actor_role: Role,
         user_id: uuid.UUID,
         ip_address: str | None,
         user_agent: str | None,
@@ -179,6 +201,13 @@ class UserService:
                 status_code=403,
             )
         membership, user = await self.get_membership(tenant=tenant, user_id=user_id)
+        # H-2: owners are immutable to anyone below owner rank
+        if membership.role == Role.OWNER and not role_at_least(actor_role, Role.OWNER):
+            raise AppError(
+                "INSUFFICIENT_ROLE",
+                "Only an owner can remove another owner.",
+                status_code=403,
+            )
         if membership.role == Role.OWNER:
             await self._ensure_not_last_owner(tenant.id, user_id)
 

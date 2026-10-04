@@ -46,7 +46,12 @@ def password_needs_rehash(password_hash: str) -> bool:
 
 
 def _create_token(
-    user_id: uuid.UUID, token_type: str, lifetime: timedelta, settings: Settings
+    user_id: uuid.UUID,
+    token_type: str,
+    lifetime: timedelta,
+    settings: Settings,
+    *,
+    extra: dict | None = None,
 ) -> str:
     now = datetime.now(UTC)
     payload = {
@@ -56,6 +61,8 @@ def _create_token(
         "iat": now,
         "exp": now + lifetime,
     }
+    if extra:
+        payload.update(extra)
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
 
 
@@ -77,17 +84,23 @@ def create_refresh_token(user_id: uuid.UUID, settings: Settings) -> str:
     )
 
 
-def create_invite_token(user_id: uuid.UUID, settings: Settings) -> str:
+def create_invite_token(
+    user_id: uuid.UUID, tenant_id: uuid.UUID, settings: Settings, *, setup: bool
+) -> str:
     """Single-purpose token handed to an invitee so they can set a password.
 
-    It only ever proves "this holder was invited" — it grants no session on
-    its own and becomes useless the moment the account is activated.
+    ``tid`` pins the invitation to one organization so it can never activate
+    or take over an account somewhere else. ``setup`` is true only for tokens
+    minted for an account *created by this invitation* — those are the only
+    ones ever allowed to set a first password (it must not depend on mutable
+    fields like ``is_active``/``status``, which admins can change).
     """
     return _create_token(
         user_id,
         INVITE_TOKEN_TYPE,
         timedelta(days=INVITE_TOKEN_EXPIRE_DAYS),
         settings,
+        extra={"tid": str(tenant_id), "setup": setup},
     )
 
 
@@ -110,6 +123,35 @@ def decode_token(token: str, settings: Settings, expected_type: str) -> uuid.UUI
         return uuid.UUID(payload["sub"])
     except (KeyError, ValueError) as exc:
         raise AppError("AUTH_TOKEN_INVALID", "Token subject is missing.") from exc
+
+
+def decode_invite_token(token: str, settings: Settings) -> tuple[uuid.UUID, uuid.UUID, bool]:
+    """Decode an invite token → ``(user_id, tenant_id, setup)``.
+
+    Raises AppError(401) for expired/invalid tokens; tokens missing the
+    organization scope or the setup flag (e.g. issued before those claims
+    existed) are rejected as invalid.
+    """
+    try:
+        payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
+    except jwt.ExpiredSignatureError as exc:
+        raise AppError("AUTH_TOKEN_EXPIRED") from exc
+    except jwt.InvalidTokenError as exc:
+        raise AppError("AUTH_TOKEN_INVALID") from exc
+
+    if payload.get("type") != INVITE_TOKEN_TYPE:
+        raise AppError("AUTH_TOKEN_INVALID", "Token has the wrong purpose.")
+    try:
+        user_id = uuid.UUID(payload["sub"])
+        tenant_id = uuid.UUID(payload["tid"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AppError(
+            "AUTH_TOKEN_INVALID", "Invite token is missing its organization scope."
+        ) from exc
+    setup = payload.get("setup")
+    if not isinstance(setup, bool):
+        raise AppError("AUTH_TOKEN_INVALID", "Invite token is missing its setup claim.")
+    return user_id, tenant_id, setup
 
 
 def generate_api_key(environment: str) -> tuple[str, str]:

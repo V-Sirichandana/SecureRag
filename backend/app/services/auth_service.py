@@ -16,10 +16,10 @@ from app.core.config import Settings
 from app.core.exceptions import AppError, ConflictError
 from app.core.permissions import Role
 from app.core.security import (
-    INVITE_TOKEN_TYPE,
     REFRESH_TOKEN_TYPE,
     create_access_token,
     create_refresh_token,
+    decode_invite_token,
     decode_token,
     hash_password,
     verify_password,
@@ -210,11 +210,16 @@ async def accept_invite(
     ip_address: str | None,
     user_agent: str | None,
 ) -> SessionOut:
-    """Activate an invited account: verify the invite token, set the first
-    password and return a live session for the new member."""
+    """Accept an invitation.
+
+    Only a token minted for an account *created by that invitation* may set
+    the first password, and only while its membership in the inviting
+    organization still exists. Tokens for accounts that already existed never
+    touch credentials — they just prove the invitee already has an account.
+    """
     users = UserRepository(db)
     try:
-        user_id = decode_token(payload.token, settings, INVITE_TOKEN_TYPE)
+        user_id, tenant_id, setup = decode_invite_token(payload.token, settings)
     except AppError as exc:
         if exc.code == "AUTH_TOKEN_EXPIRED":
             raise AppError("INVITE_EXPIRED") from exc
@@ -223,8 +228,21 @@ async def accept_invite(
     user = await users.get(user_id)
     if user is None:
         raise AppError("INVITE_INVALID")
+
+    # the invitation only lives while its membership exists (revocation = delete)
+    membership = await users.membership(user_id, tenant_id)
+    if membership is None:
+        raise AppError("INVITE_INVALID")
+
+    if not setup:
+        # C-1: the account predates this invitation — credentials are never
+        # touched and no session is issued; the holder simply logs in.
+        if user.is_active:
+            raise ConflictError("INVITE_ALREADY_ACCEPTED")
+        raise AppError("ACCOUNT_DISABLED")
+
     if user.is_active:
-        # the token is single-use: it dies with the account it activates
+        # a setup token is single-use: it dies with the account it activates
         raise ConflictError("INVITE_ALREADY_ACCEPTED")
 
     user.password_hash = hash_password(payload.password)
@@ -232,8 +250,7 @@ async def accept_invite(
     user.status = "active"
     user.last_login_at = datetime.now(UTC)
 
-    memberships = await users.memberships_with_tenants(user.id)
-    tenant = memberships[0][1] if memberships else None
+    tenant = await TenantRepository(db).get(tenant_id)
     await AuditService(db).log(
         user=user,
         tenant=tenant,
