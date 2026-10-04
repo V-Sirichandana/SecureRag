@@ -64,7 +64,9 @@ async def retrieve(
 
     The tenant and user come from the authenticated principal; document
     visibility is checked against CURRENT permissions in the database on
-    every request. The request body cannot influence either.
+    every request. The request body cannot influence either. The retrieval
+    mode (vector/hybrid) and the meaning of ``score`` are server-side
+    configuration — the request body cannot select them.
     """
     retriever = get_retriever(settings, db=db, vector_store=vector_store)
     chunks = await retriever.retrieve(

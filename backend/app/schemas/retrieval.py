@@ -26,10 +26,19 @@ class RetrieveIn(APIModel):
 class RetrievedChunkOut(APIModel):
     """One authorized retrieval hit.
 
-    ``score`` is the original vector-search similarity (never overwritten).
-    ``rerankScore`` is the optional provider-specific reranker score, null
-    when no reranking was applied. The two are different scales and are not
-    directly comparable across reranker providers.
+    ``score`` is mode-dependent — ``RETRIEVAL_MODE`` is server-side
+    configuration and the request body cannot select it:
+
+    * vector mode: the original vector-search similarity (never
+      overwritten);
+    * hybrid mode: the fused Reciprocal Rank Fusion score of the authorized
+      candidates (raw vector/lexical scores stay internal).
+
+    The field keeps the same float shape in both modes, but the two meanings
+    are not comparable across modes. ``rerankScore`` is the optional
+    provider-specific reranker score, null when no reranking was applied.
+    The two are different scales and are not directly comparable across
+    reranker providers.
     """
 
     chunk_id: str

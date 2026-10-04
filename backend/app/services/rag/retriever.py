@@ -22,12 +22,30 @@ check, and it cannot widen the result set beyond what those checks allowed.
 for keyword candidates — validate → resolve role → tenant-fenced lexical
 candidate generation → CURRENT permission filter → reranker — while the
 ``retrieve()`` flow above stays vector-only.
+
+Hybrid flow (milestone 4, ``RETRIEVAL_MODE=hybrid`` — server-side
+configuration, never client-selectable)::
+
+    query → validate → resolve role (DB)
+          → vector candidates (server tenant fence)
+          + lexical candidates (server tenant fence)
+          → deduplicate by chunk_id
+          → ONE CURRENT permission check over the union
+          → RRF fusion over AUTHORIZED candidates only
+          → existing reranker pool cap → reranker → final top-k
+
+Vector mode keeps the flow above byte-identical: ``score`` is the original
+vector similarity. In hybrid mode ``score`` becomes the fused Reciprocal
+Rank Fusion score (``RRF_K = 60``); raw vector/lexical scores and source
+ranks stay internal to this module and are never exposed through the API.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import uuid
+from dataclasses import dataclass, replace
 from typing import Any
 
 from sqlalchemy import select
@@ -55,6 +73,89 @@ DEFAULT_TOP_K = 10
 MAX_CANDIDATES = 40
 MAX_EXPANSION_ROUNDS = 3
 
+# Reciprocal Rank Fusion constant (milestone 4): contribution = 1 / (60 + rank)
+RRF_K = 60
+
+
+@dataclass
+class _FusedCandidate:
+    """Internal hybrid candidate — never exposed outside this module.
+
+    Holds the carrier :class:`RetrievedChunk` plus the PRIVATE per-source
+    ranks and raw scores captured at deduplication time. ``chunk.score`` is
+    rewritten to ``fused_score`` only on a copy when hybrid results are
+    produced; the raw ``vector_score`` / ``lexical_score`` are kept purely
+    for provenance and never reach the API.
+    """
+
+    chunk: RetrievedChunk
+    vector_rank: int | None = None
+    lexical_rank: int | None = None
+    vector_score: float | None = None
+    lexical_score: float | None = None
+    fused_score: float = 0.0
+
+
+def _union_candidates(
+    vector_results: list[RetrievedChunk],
+    lexical_results: list[RetrievedChunk],
+) -> list[_FusedCandidate]:
+    """Deduplicate both sources by ``chunk_id``, retaining private source ranks.
+
+    The vector-sourced chunk is the carrier when a chunk appears in both
+    sources (its raw similarity is preserved in ``vector_score``);
+    lexical-only chunks carry their lexical ``RetrievedChunk``. Ranks are
+    1-based positions captured at fetch time — BEFORE authorization — so
+    dropping unauthorized candidates later never renumber them.
+    """
+    union: dict[str, _FusedCandidate] = {}
+    for rank, chunk in enumerate(vector_results, start=1):
+        union[chunk.chunk_id] = _FusedCandidate(
+            chunk=chunk, vector_rank=rank, vector_score=chunk.score
+        )
+    for rank, chunk in enumerate(lexical_results, start=1):
+        existing = union.get(chunk.chunk_id)
+        if existing is None:
+            union[chunk.chunk_id] = _FusedCandidate(
+                chunk=chunk, lexical_rank=rank, lexical_score=chunk.score
+            )
+        else:
+            existing.lexical_rank = rank
+            existing.lexical_score = chunk.score
+    return list(union.values())
+
+
+def _rrf_fuse(candidates: list[_FusedCandidate]) -> list[_FusedCandidate]:
+    """Reciprocal Rank Fusion over already-authorized candidates.
+
+    ``fused_score = Σ 1 / (RRF_K + rank)`` across the sources where the
+    candidate appears; raw vector/lexical scores never enter the formula.
+    Ordering is fully deterministic: fused score DESC, then vector rank ASC
+    (missing = +inf), then lexical rank ASC (missing = +inf), then
+    ``chunk_id`` ASC. Returns new instances — inputs are never mutated.
+    """
+    fused: list[_FusedCandidate] = []
+    for candidate in candidates:
+        score = 0.0
+        if candidate.vector_rank is not None:
+            score += 1.0 / (RRF_K + candidate.vector_rank)
+        if candidate.lexical_rank is not None:
+            score += 1.0 / (RRF_K + candidate.lexical_rank)
+        fused.append(replace(candidate, fused_score=score))
+    fused.sort(
+        key=lambda candidate: (
+            -candidate.fused_score,
+            candidate.vector_rank
+            if candidate.vector_rank is not None
+            else math.inf,
+            candidate.lexical_rank
+            if candidate.lexical_rank is not None
+            else math.inf,
+            candidate.chunk.chunk_id,
+        )
+    )
+    return fused
+
 
 class TenantScopedRetriever:
     """Implements the :class:`Retriever` protocol.
@@ -66,7 +167,12 @@ class TenantScopedRetriever:
     never influences which documents the caller is allowed to read. An
     optional lexical index is injected and exposed through the separate
     :meth:`retrieve_lexical` candidate path (milestone 3); the public
-    ``retrieve()`` method remains vector-only until the hybrid merge.
+    ``retrieve()`` method stays vector-only until the hybrid merge.
+
+    ``retrieval_mode`` (milestone 4) is server-side configuration:
+    ``"vector"`` (default) keeps ``retrieve()`` exactly as before,
+    ``"hybrid"`` adds the fused candidate path. An unknown internal mode is
+    rejected at construction — it never silently becomes hybrid.
     """
 
     def __init__(
@@ -79,6 +185,7 @@ class TenantScopedRetriever:
         rerank_top_k: int = DEFAULT_TOP_K,
         rerank_max_candidates: int | None = None,
         lexical_index: LexicalIndex | None = None,
+        retrieval_mode: str = "vector",
     ) -> None:
         self.db = db
         self.embedder = embedder
@@ -89,6 +196,12 @@ class TenantScopedRetriever:
         # only the separate retrieve_lexical() path reads this; retrieve()
         # stays vector-only until the hybrid merge
         self.lexical_index = lexical_index
+        mode = (retrieval_mode or "").strip().lower()
+        if mode not in ("vector", "hybrid"):
+            raise ValueError(
+                f"retrieval_mode must be 'vector' or 'hybrid', got {retrieval_mode!r}"
+            )
+        self.retrieval_mode = mode
 
     async def retrieve(
         self,
@@ -101,6 +214,15 @@ class TenantScopedRetriever:
     ) -> list[RetrievedChunk]:
         text = self._validate(query, top_k)
         role = await self._resolve_role(tenant_id=tenant_id, user_id=user_id)
+        if self.retrieval_mode == "hybrid":
+            return await self._hybrid_search(
+                query=text,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                role=role,
+                collection_ids=collection_ids,
+                top_k=top_k,
+            )
         vector = await self._embed(text)
         return await self._search(
             query=text,
@@ -229,6 +351,75 @@ class TenantScopedRetriever:
         # ONLY authorized chunks are handed to the reranker
         return await self._rerank(query=query, chunks=authorized, top_k=top_k)
 
+    async def _hybrid_search(
+        self,
+        *,
+        query: str,
+        tenant_id: str,
+        user_id: str,
+        role: Role,
+        collection_ids: list[str] | None,
+        top_k: int,
+    ) -> list[RetrievedChunk]:
+        """Vector + lexical candidates → ONE permission check → RRF → rerank.
+
+        Milestone 4 security boundary, in order: an explicitly configured
+        hybrid mode requires a real lexical index (501 otherwise — never a
+        silent vector-only fallback) → embed ONCE (vector retrieval only;
+        lexical receives the validated query text) → both sources fetch the
+        same bounded ``_initial_fetch(top_k)`` size (≤ ``MAX_CANDIDATES``),
+        each applying its OWN server-derived tenant fence → deduplicate by
+        ``chunk_id`` → :meth:`_visible_document_ids` EXACTLY once over the
+        union → RRF fusion over AUTHORIZED candidates only → the existing
+        reranker pool cap → the existing reranker.
+
+        Any source failure propagates with the existing error mapping (no
+        partial hybrid results); a source returning ``[]`` is successful
+        retrieval, not a failure.
+        """
+        self._require_lexical_index()
+        vector = await self._embed(query)  # exactly once, vector path only
+        fetch = self._initial_fetch(top_k)
+        extra_filter: dict[str, Any] | None = (
+            {"collection_id": collection_ids} if collection_ids else None
+        )
+        vector_candidates = await self._vector_search(
+            vector=vector, tenant_id=tenant_id, fetch=fetch, extra_filter=extra_filter
+        )
+        lexical_candidates = await self._lexical_candidates(
+            query=query, tenant_id=tenant_id, collection_ids=collection_ids, fetch=fetch
+        )
+
+        # deduplicate BEFORE authorization: one choke point over the union
+        union = _union_candidates(vector_candidates, lexical_candidates)
+        visible = await self._visible_document_ids(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            role=role,
+            candidates=[candidate.chunk for candidate in union],
+        )
+        authorized = [
+            candidate for candidate in union if candidate.chunk.document_id in visible
+        ]
+        # ONLY authorized candidates are fused — unauthorized chunks never
+        # receive a fused score, never enter the ordering, never reach the
+        # reranker
+        fused = _rrf_fuse(authorized)
+        chunks = [replace(candidate.chunk, score=candidate.fused_score) for candidate in fused]
+        # the existing _rerank applies _rerank_pool_limit (40) and top_k;
+        # rerank_score behavior is unchanged
+        return await self._rerank(query=query, chunks=chunks, top_k=top_k)
+
+    def _require_lexical_index(self) -> None:
+        """Hybrid mode must never silently degrade to vector-only retrieval."""
+        from app.services.rag.lexical import NullLexicalIndex  # cycle guard
+
+        if self.lexical_index is None or isinstance(self.lexical_index, NullLexicalIndex):
+            raise AppError(
+                "SERVICE_NOT_CONFIGURED",
+                "Hybrid retrieval requires a configured lexical index.",
+            )
+
     async def _lexical_search(
         self,
         *,
@@ -251,8 +442,39 @@ class TenantScopedRetriever:
         if self.lexical_index is None:
             return []
         fetch = self._initial_fetch(top_k)
+        candidates = await self._lexical_candidates(
+            query=query,
+            tenant_id=tenant_id,
+            collection_ids=collection_ids,
+            fetch=fetch,
+        )
+
+        visible = await self._visible_document_ids(
+            tenant_id=tenant_id, user_id=user_id, role=role, candidates=candidates
+        )
+        authorized = [chunk for chunk in candidates if chunk.document_id in visible]
+        # ONLY authorized chunks are handed to the reranker
+        return await self._rerank(query=query, chunks=authorized, top_k=top_k)
+
+    async def _lexical_candidates(
+        self,
+        *,
+        query: str,
+        tenant_id: str,
+        collection_ids: list[str] | None,
+        fetch: int,
+    ) -> list[RetrievedChunk]:
+        """Source-level lexical candidate generation — no authorization, no rerank.
+
+        The single seam both the lexical and hybrid paths use, so the error
+        mapping can never drift between them: domain errors keep their
+        status, unexpected storage failures become SERVICE_UNAVAILABLE (503)
+        without leaking internals.
+        """
+        if self.lexical_index is None:
+            return []
         try:
-            candidates = await self.lexical_index.search(
+            return await self.lexical_index.search(
                 query=query,
                 tenant_id=tenant_id,
                 collection_ids=collection_ids,
@@ -263,13 +485,6 @@ class TenantScopedRetriever:
         except Exception as exc:  # noqa: BLE001 - never leak storage internals
             logger.exception("Lexical search failed")
             raise AppError("SERVICE_UNAVAILABLE") from exc
-
-        visible = await self._visible_document_ids(
-            tenant_id=tenant_id, user_id=user_id, role=role, candidates=candidates
-        )
-        authorized = [chunk for chunk in candidates if chunk.document_id in visible]
-        # ONLY authorized chunks are handed to the reranker
-        return await self._rerank(query=query, chunks=authorized, top_k=top_k)
 
     def _initial_fetch(self, top_k: int) -> int:
         """Vector candidate request size for one round.

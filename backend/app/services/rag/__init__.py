@@ -91,9 +91,12 @@ def get_retriever(
     unknown ``RERANKER_PROVIDER`` raises SERVICE_NOT_CONFIGURED (501) with no
     fallback to another provider. The lexical index is bound to the request's
     database session (milestone 3 Option A: ``SqlLexicalIndex`` on ``db``);
-    with no session it stays the explicit ``NullLexicalIndex``. The public
-    ``retrieve()`` path remains vector-only — the lexical index is a
-    capability for the separate lexical candidate path, not a hybrid merge.
+    with no session it stays the explicit ``NullLexicalIndex``.
+    ``settings.retrieval_mode`` (server-side only, default ``vector``) is
+    passed through: ``vector`` keeps ``retrieve()`` exactly as before;
+    ``hybrid`` (milestone 4) activates the fused vector + lexical candidate
+    path inside the retriever — the endpoint and ``RetrieveIn`` stay
+    mode-agnostic.
     """
     from app.services.rag.retriever import TenantScopedRetriever
 
@@ -106,6 +109,7 @@ def get_retriever(
         rerank_top_k=settings.reranker_top_k,
         rerank_max_candidates=settings.reranker_max_candidates,
         lexical_index=get_lexical_index(settings, db=db),
+        retrieval_mode=settings.retrieval_mode,
     )
 
 
