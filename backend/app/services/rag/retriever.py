@@ -17,6 +17,11 @@ changes.
 The reranker never participates in authorization: it only ever receives
 chunks that already passed the tenant filter and the CURRENT permission
 check, and it cannot widen the result set beyond what those checks allowed.
+
+``retrieve_lexical()`` (milestone 3) mirrors the same authorization contract
+for keyword candidates — validate → resolve role → tenant-fenced lexical
+candidate generation → CURRENT permission filter → reranker — while the
+``retrieve()`` flow above stays vector-only.
 """
 
 from __future__ import annotations
@@ -59,8 +64,9 @@ class TenantScopedRetriever:
     passed in by the caller from the authenticated principal. The reranker is
     a pure re-ordering step applied AFTER authorization; it never sees and
     never influences which documents the caller is allowed to read. An
-    optional lexical index may be injected but is not consulted yet —
-    retrieval stays vector-only until the hybrid merge.
+    optional lexical index is injected and exposed through the separate
+    :meth:`retrieve_lexical` candidate path (milestone 3); the public
+    ``retrieve()`` method remains vector-only until the hybrid merge.
     """
 
     def __init__(
@@ -80,8 +86,8 @@ class TenantScopedRetriever:
         self.reranker = reranker
         self.rerank_top_k = rerank_top_k
         self.rerank_max_candidates = rerank_max_candidates
-        # dependency-injection seam only: deliberately never read here, so
-        # lexical search cannot influence results before the hybrid merge
+        # only the separate retrieve_lexical() path reads this; retrieve()
+        # stays vector-only until the hybrid merge
         self.lexical_index = lexical_index
 
     async def retrieve(
@@ -99,6 +105,36 @@ class TenantScopedRetriever:
         return await self._search(
             query=text,
             vector=vector,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            role=role,
+            collection_ids=collection_ids,
+            top_k=top_k,
+        )
+
+    async def retrieve_lexical(
+        self,
+        *,
+        query: str,
+        tenant_id: str,
+        user_id: str,
+        collection_ids: list[str] | None = None,
+        top_k: int = DEFAULT_TOP_K,
+    ) -> list[RetrievedChunk]:
+        """Lexical (keyword) candidate path — milestone 3.
+
+        Deliberately separate from :meth:`retrieve`, which stays byte-identical
+        vector-only. Same authorization contract, same order of operations:
+        validate → resolve the role from the database → tenant-fenced lexical
+        candidate generation (a candidate generator, NOT an authorization
+        layer) → CURRENT document permissions as the only visibility truth →
+        reranker over authorized chunks only. Returns ``[]`` when no lexical
+        index is wired.
+        """
+        text = self._validate(query, top_k)
+        role = await self._resolve_role(tenant_id=tenant_id, user_id=user_id)
+        return await self._lexical_search(
+            query=text,
             tenant_id=tenant_id,
             user_id=user_id,
             role=role,
@@ -190,6 +226,48 @@ class TenantScopedRetriever:
                 break
             fetch = min(fetch * 2, MAX_CANDIDATES)
 
+        # ONLY authorized chunks are handed to the reranker
+        return await self._rerank(query=query, chunks=authorized, top_k=top_k)
+
+    async def _lexical_search(
+        self,
+        *,
+        query: str,
+        tenant_id: str,
+        user_id: str,
+        role: Role,
+        collection_ids: list[str] | None,
+        top_k: int,
+    ) -> list[RetrievedChunk]:
+        """Lexical candidates → CURRENT permission filter → rerank.
+
+        Single-shot (no expansion rounds): the fetch is bounded by the same
+        ``_initial_fetch`` sizing as the vector path (never above
+        ``MAX_CANDIDATES``, hence never above ``MAX_TOP_K`` either). The
+        lexical index only fences by tenant inside SQL — visibility is
+        decided exclusively here, from the CURRENT database permissions,
+        exactly as in the vector path.
+        """
+        if self.lexical_index is None:
+            return []
+        fetch = self._initial_fetch(top_k)
+        try:
+            candidates = await self.lexical_index.search(
+                query=query,
+                tenant_id=tenant_id,
+                collection_ids=collection_ids,
+                top_k=fetch,
+            )
+        except AppError:
+            raise  # SERVICE_NOT_CONFIGURED / VALIDATION keep their status
+        except Exception as exc:  # noqa: BLE001 - never leak storage internals
+            logger.exception("Lexical search failed")
+            raise AppError("SERVICE_UNAVAILABLE") from exc
+
+        visible = await self._visible_document_ids(
+            tenant_id=tenant_id, user_id=user_id, role=role, candidates=candidates
+        )
+        authorized = [chunk for chunk in candidates if chunk.document_id in visible]
         # ONLY authorized chunks are handed to the reranker
         return await self._rerank(query=query, chunks=authorized, top_k=top_k)
 

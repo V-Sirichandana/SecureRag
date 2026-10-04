@@ -1,7 +1,8 @@
-"""Milestone 1: the lexical seam — null provider, factory, retrieval mode.
+"""Milestone 1/3: the lexical seam — providers, factory, retrieval mode.
 
-No lexical backend exists yet: the factory must resolve the explicit
-``NullLexicalIndex``, its operations must be safe no-ops, and the default
+The factory resolves the SQL-backed index when a request session is
+provided (milestone 3 Option A) and the explicit ``NullLexicalIndex``
+otherwise; null operations are safe no-ops, and the default
 ``RETRIEVAL_MODE=vector`` must keep the vector-only retrieval behavior
 exactly as before.
 """
@@ -15,7 +16,7 @@ from app.db.database import create_all, drop_all
 from app.main import create_app
 from app.services.rag import get_lexical_index, get_retriever
 from app.services.rag.base import LexicalIndex
-from app.services.rag.lexical import NullLexicalIndex
+from app.services.rag.lexical import NullLexicalIndex, SqlLexicalIndex
 from tests.conftest import auth, create_collection
 
 TEST_JWT = "test-secret-key-not-for-production"
@@ -48,8 +49,16 @@ def test_factory_resolves_null_lexical_index():
 
 
 def test_retriever_receives_lexical_dependency():
+    # milestone 3 Option A: the factory forwards the request session, so the
+    # retriever gets the real SQL-backed index (search runs on it)
     settings = Settings(_env_file=None)
     retriever = get_retriever(settings, db=object(), vector_store=object())
+    assert isinstance(retriever.lexical_index, SqlLexicalIndex)
+
+
+def test_retriever_without_session_keeps_null_index():
+    settings = Settings(_env_file=None)
+    retriever = get_retriever(settings, db=None, vector_store=object())
     assert isinstance(retriever.lexical_index, NullLexicalIndex)
 
 

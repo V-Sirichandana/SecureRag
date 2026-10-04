@@ -89,8 +89,11 @@ def get_retriever(
     settings (raises SERVICE_NOT_CONFIGURED if QDRANT_URL is empty). The
     configured reranker is resolved here through :func:`get_reranker` — an
     unknown ``RERANKER_PROVIDER`` raises SERVICE_NOT_CONFIGURED (501) with no
-    fallback to another provider. The lexical index is injected through
-    :func:`get_lexical_index` but is not consulted by retrieval yet.
+    fallback to another provider. The lexical index is bound to the request's
+    database session (milestone 3 Option A: ``SqlLexicalIndex`` on ``db``);
+    with no session it stays the explicit ``NullLexicalIndex``. The public
+    ``retrieve()`` path remains vector-only — the lexical index is a
+    capability for the separate lexical candidate path, not a hybrid merge.
     """
     from app.services.rag.retriever import TenantScopedRetriever
 
@@ -102,7 +105,7 @@ def get_retriever(
         reranker=get_reranker(settings),
         rerank_top_k=settings.reranker_top_k,
         rerank_max_candidates=settings.reranker_max_candidates,
-        lexical_index=get_lexical_index(settings),
+        lexical_index=get_lexical_index(settings, db=db),
     )
 
 

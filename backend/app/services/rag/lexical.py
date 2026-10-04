@@ -1,4 +1,4 @@
-"""Lexical index seam — SQL storage implementation and the no-op provider.
+"""Lexical index seam — SQL storage and tenant-scoped search.
 
 ``LexicalIndex`` (see :mod:`app.services.rag.base`) is the keyword/BM25
 retrieval abstraction. Two implementations live here:
@@ -7,10 +7,17 @@ retrieval abstraction. Two implementations live here:
   caller's own :class:`~sqlalchemy.ext.asyncio.AsyncSession`. Writes use
   ``flush()`` and **never** commit: the caller (``DocumentService``) owns the
   transaction, so chunk rows and the document status change atomically.
+  Since milestone 3 it also implements :meth:`SqlLexicalIndex.search` — a
+  read-only, tenant-fenced candidate generator (PostgreSQL GIN / SQLite
+  FTS5). Search never flushes, commits or runs DDL, and it makes NO
+  authorization decisions beyond the tenant fence: document visibility is
+  applied afterwards by the retriever from the CURRENT database permissions.
 * :class:`NullLexicalIndex` — the explicit no-op used whenever no database
   session is available. It is never a silent fallback from a real provider.
 
-Storage details (milestone 2 — storage only, retrieval stays vector-only):
+Storage details (milestone 2 added the storage; retrieval stays vector-only
+by default — milestone 3 adds the lexical candidate path that a later hybrid
+milestone will consume):
 
 * Canonical rows always live in ``document_chunks`` (PostgreSQL and SQLite).
 * On PostgreSQL, lexical search is served by the migration-created expression
@@ -31,11 +38,12 @@ import uuid
 from typing import Any
 
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document import DocumentChunk
 from app.services.rag.base import RetrievedChunk
+from app.services.rag.retriever import MAX_TOP_K
 
 # FTS5 mirror: chunk identity + tenant/document metadata are UNINDEXED
 # (stored, filterable, not tokenized); only ``text`` is searchable.
@@ -57,6 +65,89 @@ _FTS5_DELETE = """
 DELETE FROM document_chunks_fts
 WHERE tenant_id = :tenant_id AND document_id = :document_id
 """
+
+# Milestone 3 — search. Phase 1 over the mirror: ranked chunk ids, tenant
+# fence in SQL, bounded LIMIT, bm25 ASC (FTS5: more negative = better) with a
+# chunk_id ASC tiebreak for deterministic ordering.
+_FTS5_MATCH = """
+SELECT chunk_id, bm25(document_chunks_fts) AS r
+FROM document_chunks_fts
+WHERE document_chunks_fts MATCH :match
+  AND tenant_id = :tenant_id
+ORDER BY r ASC, chunk_id ASC
+LIMIT :fetch
+"""
+
+# Read-only mirror existence check — search never runs DDL, so a database
+# that has never indexed anything simply yields no candidates.
+_FTS5_EXISTS = (
+    "SELECT count(*) FROM sqlite_master "
+    "WHERE type = 'table' AND name = 'document_chunks_fts'"
+)
+
+
+def postgres_search_statement(collection_count: int = 0) -> str:
+    """Static SQL for the PostgreSQL search branch.
+
+    ``to_tsvector('simple', text)`` is byte-identical to the expression GIN
+    index created by migration 0002, so the planner can use it — the config
+    must never be switched silently. Only placeholder names (``:c0``, ``:c1``,
+    ...) are composed here; every VALUE (query, tenant, collection ids, fetch)
+    travels in the bound-params dict, never in the SQL text.
+    """
+    collection_clause = ""
+    if collection_count:
+        placeholders = ", ".join(f":c{i}" for i in range(collection_count))
+        collection_clause = f" AND collection_id IN ({placeholders})"
+    return (
+        "SELECT chunk_id, document_id, collection_id, page, filename, text, "
+        "chunk_index, ts_rank_cd(to_tsvector('simple', text), q) AS score "
+        "FROM document_chunks, websearch_to_tsquery('simple', :query) AS q "
+        "WHERE tenant_id = :tenant_id "
+        "AND to_tsvector('simple', text) @@ q"
+        f"{collection_clause} "
+        "ORDER BY score DESC, chunk_id ASC "
+        "LIMIT :fetch"
+    )
+
+
+def _fts_tokens(query: str) -> list[str]:
+    """Sanitize a user query into plain alphanumeric tokens.
+
+    Both engines search ONLY these tokens (SQLite as quoted phrases,
+    PostgreSQL as websearch words), so quotes, parentheses, ``*``, ``NEAR``,
+    column selectors and malformed FTS expressions can never inject syntax
+    or raise — they tokenize into inert words. The uppercase boolean
+    operators websearch understands (``AND``/``OR``/``NOT``, any case) are
+    dropped so both engines apply the same strict implicit-AND semantics.
+    """
+    tokens: list[str] = []
+    current: list[str] = []
+    for char in query or "":
+        if char.isalnum():
+            current.append(char)
+        elif current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+    return [token for token in tokens if token.upper() not in ("AND", "OR", "NOT")]
+
+
+def _bounded_fetch(top_k: Any) -> int | None:
+    """Clamp ``top_k`` to the retrieval hard cap; unusable values yield none.
+
+    Reuses ``retriever.MAX_TOP_K`` (50) — the same ceiling the API already
+    enforces. Callers going through ``_initial_fetch`` stay within
+    ``MAX_CANDIDATES`` (40) as well. No new limit is introduced here.
+    """
+    try:
+        limit = int(top_k)
+    except (TypeError, ValueError):
+        return None
+    if limit <= 0:
+        return None
+    return min(limit, MAX_TOP_K)
 
 
 class SqlLexicalIndex:
@@ -88,13 +179,148 @@ class SqlLexicalIndex:
         collection_ids: list[str] | None = None,
         top_k: int = 8,
     ) -> list[RetrievedChunk]:
-        """Not implemented in milestone 2 — storage only.
+        """Tenant-scoped lexical candidate generation (milestone 3).
 
-        Hybrid retrieval activates in a later milestone; until then the
-        retriever never consults the lexical index, so returning no
-        candidates keeps retrieval vector-only.
+        Read-only: SELECT statements only, executed with autoflush disabled
+        so a caller's pending state is never flushed, committed or mutated —
+        no DDL either (a database with no FTS mirror simply yields ``[]``).
+
+        This method is a candidate generator, NOT an authorization layer:
+        beyond the mandatory tenant fence (and the optional collection
+        filter) it returns raw candidates. Deciding who may READ a document
+        is the retriever's job, via the CURRENT database permissions.
+
+        Ordering is deterministic (engine rank, then ``chunk_id``) and the
+        result never exceeds ``min(top_k, MAX_TOP_K)`` hits.
         """
-        return []
+        fetch = _bounded_fetch(top_k)
+        if fetch is None:
+            return []
+        tokens = _fts_tokens(query)
+        if not tokens:
+            return []
+        try:
+            tenant_uuid = uuid.UUID(tenant_id)
+        except ValueError:
+            return []  # fail closed: a malformed server-derived tenant finds nothing
+        collections: list[uuid.UUID] | None = None
+        if collection_ids:
+            try:
+                collections = [uuid.UUID(str(value)) for value in collection_ids]
+            except ValueError:
+                return []  # fail closed: an unusable collection filter finds nothing
+
+        if self._uses_fts5:
+            return await self._search_fts5(tenant_uuid, collections, tokens, fetch)
+        if self._dialect == "postgresql":
+            return await self._search_postgres(tenant_uuid, collections, tokens, fetch)
+        return []  # unknown engine — fail closed
+
+    async def _search_fts5(
+        self,
+        tenant_uuid: uuid.UUID,
+        collections: list[uuid.UUID] | None,
+        tokens: list[str],
+        fetch: int,
+    ) -> list[RetrievedChunk]:
+        """Phase 1: ranked chunk ids from the FTS5 mirror; phase 2: hydrate
+        canonical rows (which re-asserts the tenant fence and applies the
+        collection filter — the mirror is never trusted alone for metadata)."""
+        match = " ".join(f'"{token}"' for token in tokens)
+        with self.db.sync_session.no_autoflush:
+            exists = (await self.db.execute(text(_FTS5_EXISTS))).scalar_one()
+            if not exists:
+                return []
+            ranked = (
+                await self.db.execute(
+                    text(_FTS5_MATCH),
+                    {
+                        "match": match,
+                        "tenant_id": str(tenant_uuid),
+                        "fetch": fetch,
+                    },
+                )
+            ).fetchall()
+            if not ranked:
+                return []
+
+            # FTS5 bm25() is negative with smaller = better; flip it so the
+            # shared RetrievedChunk score stays positive higher-is-better
+            score_by_chunk = {row[0]: -float(row[1]) for row in ranked}
+            ordered_ids = list(score_by_chunk)
+
+            stmt = select(DocumentChunk).where(
+                DocumentChunk.tenant_id == tenant_uuid,
+                DocumentChunk.chunk_id.in_(ordered_ids),
+            )
+            if collections is not None:
+                stmt = stmt.where(DocumentChunk.collection_id.in_(collections))
+            rows = (await self.db.execute(stmt)).scalars().all()
+
+        by_chunk_id = {row.chunk_id: row for row in rows}
+        results: list[RetrievedChunk] = []
+        for chunk_id in ordered_ids:  # phase-1 rank order preserved
+            row = by_chunk_id.get(chunk_id)
+            if row is None:
+                continue  # dropped by the tenant/collection fence (or stale mirror)
+            results.append(self._chunk_from_row(row, score_by_chunk[chunk_id]))
+        return results
+
+    async def _search_postgres(
+        self,
+        tenant_uuid: uuid.UUID,
+        collections: list[uuid.UUID] | None,
+        tokens: list[str],
+        fetch: int,
+    ) -> list[RetrievedChunk]:
+        """Single ranked query against the GIN-indexed tsvector expression.
+
+        `websearch_to_tsquery` accepts arbitrary input safely and the tokens
+        handed to it are already sanitised by :func:`_fts_tokens`.
+        """
+        sql = postgres_search_statement(0 if collections is None else len(collections))
+        params: dict[str, Any] = {
+            "query": " ".join(tokens),
+            "tenant_id": str(tenant_uuid),
+            "fetch": fetch,
+        }
+        if collections:
+            params.update({f"c{i}": str(value) for i, value in enumerate(collections)})
+        with self.db.sync_session.no_autoflush:
+            rows = (await self.db.execute(text(sql), params)).fetchall()
+        return [
+            RetrievedChunk(
+                text=str(row.text),
+                score=float(row.score),
+                document_id=str(row.document_id),
+                collection_id=str(row.collection_id) if row.collection_id else None,
+                page_number=int(row.page),
+                quote=str(row.text)[:200],
+                chunk_id=str(row.chunk_id),
+                filename=str(row.filename),
+                metadata={"chunk_index": int(row.chunk_index)},
+            )
+            for row in rows
+        ]
+
+    @staticmethod
+    def _chunk_from_row(row: DocumentChunk, score: float) -> RetrievedChunk:
+        """Map a canonical row to the shared retrieval model.
+
+        Only retrieval/storage fields are exposed; ``created_by``/``access``/
+        ``classification`` are never stored on chunks and never consulted.
+        """
+        return RetrievedChunk(
+            text=row.text,
+            score=score,
+            document_id=str(row.document_id),
+            collection_id=str(row.collection_id) if row.collection_id else None,
+            page_number=row.page,
+            quote=row.text[:200],
+            chunk_id=row.chunk_id,
+            filename=row.filename,
+            metadata={"chunk_index": row.chunk_index},
+        )
 
     # --------------------------------------------------------------- writing
     async def replace_document(
