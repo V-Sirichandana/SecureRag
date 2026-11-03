@@ -25,13 +25,17 @@ import { Message, StreamingIndicator } from "@/components/chat/message";
 import { MessageInput } from "@/components/chat/message-input";
 import { SourcePreview } from "@/components/chat/source-preview";
 import {
-  persistMessage,
+  createConversation,
   streamAnswer,
   submitFeedback,
 } from "@/lib/api/chat";
+import { ApiError } from "@/lib/api/client";
 import { useCollections, useConversations, useDeleteConversation } from "@/lib/queries";
-import { suggestedQuestions } from "@/lib/mock/conversations";
+import { suggestedQuestions as mockSuggestedQuestions } from "@/lib/mock/conversations";
+import { USE_MOCKS } from "@/lib/api/client";
 import type { ChatMessage, Citation, Conversation } from "@/lib/types";
+
+const suggestedQuestions = USE_MOCKS ? mockSuggestedQuestions : [];
 
 const followUps: Record<string, string[]> = {
   default: [
@@ -98,16 +102,12 @@ export function ChatWindow() {
       updatedAt: new Date().toISOString(),
     }));
 
-  const ensureConversation = (): string => {
+  const ensureConversation = async (): Promise<string> => {
     if (activeId) return activeId;
-    const created: Conversation = {
-      id: newId("conv"),
-      title: "New conversation",
-      collectionId: collectionId === "all" ? null : collectionId,
-      updatedAt: new Date().toISOString(),
-      messageCount: 0,
-      messages: [],
-    };
+    const created = await createConversation(
+      "New conversation",
+      collectionId === "all" ? null : collectionId,
+    );
     setConversations((current) => [created, ...(current ?? [])]);
     setActiveId(created.id);
     return created.id;
@@ -117,85 +117,98 @@ export function ChatWindow() {
     const question = raw.trim();
     if (!question || generating) return;
 
-    const conversationId = ensureConversation();
-    const userMessage: ChatMessage = {
-      id: newId("msg"),
-      role: "user",
-      content: question,
-      createdAt: new Date().toISOString(),
-    };
-    const assistantId = newId("msg");
-    const assistantMessage: ChatMessage = {
-      id: assistantId,
-      role: "assistant",
-      content: "",
-      citations: [],
-      createdAt: new Date().toISOString(),
-    };
-
-    setConversations((current) =>
-      (current ?? []).map((item) =>
-        item.id === conversationId
-          ? {
-              ...item,
-              title:
-                item.messages.length === 0 && item.title === "New conversation"
-                  ? question.slice(0, 48)
-                  : item.title,
-              messageCount: item.messages.length + 2,
-              updatedAt: new Date().toISOString(),
-              messages: [...item.messages, userMessage, assistantMessage],
-            }
-          : item,
-      ),
-    );
-    setInput("");
     setGenerating(true);
-
     const controller = new AbortController();
     abortRef.current = controller;
 
+    let conversationId: string | null = null;
+    let assistantId: string | null = null;
+
     try {
-      const result = await streamAnswer(question, {
-        signal: controller.signal,
-        onToken: (token) =>
-          setConversations((current) =>
-            (current ?? []).map((item) =>
-              item.id === conversationId
-                ? {
-                    ...item,
-                    messages: item.messages.map((message) =>
-                      message.id === assistantId
-                        ? { ...message, content: message.content + token }
-                        : message,
-                    ),
-                  }
-                : item,
+      conversationId = await ensureConversation();
+      const userMessage: ChatMessage = {
+        id: newId("msg"),
+        role: "user",
+        content: question,
+        createdAt: new Date().toISOString(),
+      };
+      assistantId = newId("msg");
+      const assistantMessage: ChatMessage = {
+        id: assistantId,
+        role: "assistant",
+        content: "",
+        citations: [],
+        createdAt: new Date().toISOString(),
+      };
+
+      setConversations((current) =>
+        (current ?? []).map((item) =>
+          item.id === conversationId
+            ? {
+                ...item,
+                title:
+                  item.messages.length === 0 && item.title === "New conversation"
+                    ? question.slice(0, 48)
+                    : item.title,
+                messageCount: item.messages.length + 2,
+                updatedAt: new Date().toISOString(),
+                messages: [...item.messages, userMessage, assistantMessage],
+              }
+            : item,
+        ),
+      );
+      setInput("");
+
+      const result = await streamAnswer(
+        question,
+        {
+          signal: controller.signal,
+          onToken: (token) =>
+            setConversations((current) =>
+              (current ?? []).map((item) =>
+                item.id === conversationId
+                  ? {
+                      ...item,
+                      messages: item.messages.map((message) =>
+                        message.id === assistantId
+                          ? { ...message, content: message.content + token }
+                          : message,
+                      ),
+                    }
+                  : item,
+              ),
             ),
-          ),
-        onCitations: (citations) => patchMessage(conversationId, assistantId, { citations }),
-        onMeta: (meta) => patchMessage(conversationId, assistantId, meta),
-      });
+          onCitations: (citations) =>
+            conversationId && assistantId && patchMessage(conversationId, assistantId, { citations }),
+          onMeta: (meta) =>
+            conversationId && assistantId && patchMessage(conversationId, assistantId, meta),
+        },
+        conversationId,
+        { user: userMessage, assistant: assistantMessage },
+      );
 
-      patchMessage(conversationId, assistantId, {
-        content: result.content,
-        citations: result.citations,
-        model: result.model,
-        latencyMs: result.latencyMs,
-        tokenCount: result.tokenCount,
-      });
-
-      await persistMessage(conversationId, userMessage);
-      await persistMessage(conversationId, { ...assistantMessage, ...result });
+      if (conversationId && assistantId) {
+        patchMessage(conversationId, assistantId, {
+          id: result.id ?? assistantId,
+          content: result.content,
+          citations: result.citations,
+          model: result.model,
+          latencyMs: result.latencyMs,
+          tokenCount: result.tokenCount,
+        });
+      }
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
-        patchMessage(conversationId, assistantId, {});
         toast.info("Generation stopped.");
       } else {
-        patchMessage(conversationId, assistantId, {
-          content: "Something went wrong while generating an answer. Please try again.",
-        });
-        toast.error("Failed to generate an answer.");
+        if (conversationId && assistantId) {
+          patchMessage(conversationId, assistantId, {
+            content: "Something went wrong while generating an answer. Please try again.",
+          });
+        }
+        toast.error(
+          error instanceof ApiError ? error.message : "Failed to generate an answer.",
+        );
       }
     } finally {
       setGenerating(false);

@@ -64,6 +64,7 @@ export interface StreamHandlers {
 }
 
 export interface ChatResult {
+  id?: string;
   content: string;
   citations: ChatMessage["citations"];
   model: string;
@@ -71,28 +72,15 @@ export interface ChatResult {
   tokenCount: number;
 }
 
-/**
- * Simulates a token stream so the UI exercises the same code path a real
- * SSE/WebSocket backend would drive. Swap the body for a fetch stream when
- * FastAPI lands — nothing in the chat components needs to change.
- */
-export async function streamAnswer(
-  question: string,
-  handlers: StreamHandlers,
-): Promise<ChatResult> {
-  const { content, citations } = answerFor(question);
-  const startedAt = performance.now();
-  const latencyMs = 700 + Math.round(Math.random() * 600);
+/** The optimistic messages the UI already rendered while the answer loads. */
+export interface PendingMessages {
+  user: ChatMessage;
+  assistant: ChatMessage;
+}
 
-  await latency(latencyMs, latencyMs + 120);
-  if (handlers.signal?.aborted) throw new DOMException("Aborted", "AbortError");
-
-  handlers.onCitations(citations);
-  handlers.onMeta({ model: "gpt-4o-mini", latencyMs, tokenCount: 0 });
-
+async function feedTokens(content: string, handlers: StreamHandlers): Promise<string> {
   const chunks = content.match(/\S+\s*/g) ?? [];
   let produced = "";
-
   for (const chunk of chunks) {
     if (handlers.signal?.aborted) {
       handlers.onToken("");
@@ -102,36 +90,89 @@ export async function streamAnswer(
     handlers.onToken(chunk);
     await new Promise((resolve) => setTimeout(resolve, 12 + Math.random() * 26));
   }
-
-  return {
-    content: produced || content,
-    citations,
-    model: "gpt-4o-mini",
-    latencyMs: Math.round(performance.now() - startedAt),
-    tokenCount: Math.round(produced.length / 4),
-  };
+  return produced;
 }
 
-export async function persistMessage(
+function persistMockDraft(
   conversationId: string,
-  message: ChatMessage,
-): Promise<void> {
-  if (USE_MOCKS) {
-    const conversation = mockConversations.find((item) => item.id === conversationId);
-    if (conversation) {
-      conversation.messages.push(message);
-      conversation.messageCount = conversation.messages.length;
-      conversation.updatedAt = new Date().toISOString();
-      if (conversation.title === "New conversation" && message.role === "user") {
-        conversation.title = message.content.slice(0, 48);
-      }
-    }
-    return;
+  pending: PendingMessages,
+  result: ChatResult,
+): void {
+  const conversation = mockConversations.find((item) => item.id === conversationId);
+  if (!conversation) return;
+  conversation.messages.push(pending.user, { ...pending.assistant, ...result });
+  conversation.messageCount = conversation.messages.length;
+  conversation.updatedAt = new Date().toISOString();
+  if (conversation.title === "New conversation") {
+    conversation.title = pending.user.content.slice(0, 48);
   }
-  await request(`/chat/conversations/${conversationId}/messages`, {
+}
+
+/**
+ * Delivers an answer to the UI and owns persistence in both modes.
+ *
+ * Mock mode simulates a token stream, then stores the pending messages in the
+ * in-memory conversation. Real mode POSTs the question to the backend, which
+ * retrieves, generates and persists both messages server-side (citations are
+ * rebuilt from retrieved context there — the provider never supplies them);
+ * the backend already returned the complete grounded answer, so it is rendered
+ * as-is until a real SSE stream endpoint exists.
+ */
+export async function streamAnswer(
+  question: string,
+  handlers: StreamHandlers,
+  conversationId: string,
+  pending: PendingMessages,
+): Promise<ChatResult> {
+  if (USE_MOCKS) {
+    const { content, citations } = answerFor(question);
+    const startedAt = performance.now();
+    const latencyMs = 700 + Math.round(Math.random() * 600);
+
+    await latency(latencyMs, latencyMs + 120);
+    if (handlers.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+
+    handlers.onCitations(citations);
+    handlers.onMeta({ model: "gpt-4o-mini", latencyMs, tokenCount: 0 });
+
+    const produced = await feedTokens(content, handlers);
+    const result: ChatResult = {
+      id: pending.assistant.id,
+      content: produced || content,
+      citations,
+      model: "gpt-4o-mini",
+      latencyMs: Math.round(performance.now() - startedAt),
+      tokenCount: Math.round(produced.length / 4),
+    };
+    persistMockDraft(conversationId, pending, result);
+    return result;
+  }
+
+  const saved = await request<ChatMessage>(`/chat/conversations/${conversationId}/messages`, {
     method: "POST",
-    body: message,
+    body: { role: "user", content: question },
+    signal: handlers.signal,
   });
+
+  const content = saved.content ?? "";
+  const citations = saved.citations ?? [];
+  const model = saved.model ?? "assistant";
+  const latencyMs = saved.latencyMs ?? 0;
+  const tokenCount = saved.tokenCount ?? 0;
+
+  handlers.onCitations(citations);
+  handlers.onMeta({ model, latencyMs, tokenCount });
+
+  // No SSE endpoint exists yet: the backend already returned the complete
+  // grounded answer, so render it as-is instead of simulating token streaming.
+  return {
+    id: saved.id,
+    content,
+    citations,
+    model,
+    latencyMs,
+    tokenCount,
+  };
 }
 
 export async function submitFeedback(messageId: string, feedback: "up" | "down"): Promise<void> {

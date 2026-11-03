@@ -59,7 +59,11 @@ export function SourcePreview({ citation, onOpenChange }: SourcePreviewProps) {
                 {document.data?.name ?? citation?.documentName ?? "Source"}
               </SheetTitle>
               <SheetDescription className="mt-1">
-                {citation ? `Page ${citation.pageNumber} · ${citation.collectionName}` : ""}
+                {citation
+                  ? `Page ${citation.pageNumber}${
+                      citation.collectionName ? ` · ${citation.collectionName}` : ""
+                    }`
+                  : ""}
               </SheetDescription>
             </div>
             <div className="flex shrink-0 items-center gap-1.5">

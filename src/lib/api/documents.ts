@@ -1,6 +1,7 @@
-import { USE_MOCKS, request } from "./client";
+import { USE_MOCKS, request, uploadRequest } from "./client";
 import { documents as mockDocuments, documentPages, fallbackPages } from "@/lib/mock/documents";
 import { latency } from "@/lib/mock/utils";
+import { isValidUuid } from "@/lib/upload-workflow";
 import type { Classification, DocumentRecord, DocumentStatus, FileType } from "@/lib/types";
 
 export interface DocumentFilters {
@@ -65,6 +66,34 @@ export async function getDocumentPages(id: string) {
   return request<Awaited<ReturnType<typeof fallbackPages>>>(`/documents/${id}/pages`);
 }
 
+function mockCreateDocument(
+  name: string,
+  collectionId: string,
+  classification: Classification,
+): DocumentRecord {
+  const collection = mockDocuments.find((doc) => doc.collectionId === collectionId);
+  const extension = name.split(".").pop()?.toLowerCase() as FileType;
+  const created: DocumentRecord = {
+    id: `doc_${Math.random().toString(36).slice(2, 9)}`,
+    name,
+    fileType: extension,
+    sizeBytes: Math.round(400_000 + Math.random() * 6_000_000),
+    collectionId,
+    collectionName: collection?.collectionName ?? "Unfiled",
+    owner: "Vishvendra Vadla",
+    department: "Executive",
+    classification,
+    status: "processing",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    pageCount: Math.round(4 + Math.random() * 60),
+    chunkCount: 0,
+    tags: [],
+  };
+  mockDocuments.unshift(created);
+  return created;
+}
+
 export async function uploadDocument(input: {
   name: string;
   collectionId: string;
@@ -72,29 +101,52 @@ export async function uploadDocument(input: {
 }): Promise<DocumentRecord> {
   if (USE_MOCKS) {
     await latency(900, 1600);
-    const collection = mockDocuments.find((doc) => doc.collectionId === input.collectionId);
-    const extension = input.name.split(".").pop()?.toLowerCase() as FileType;
-    const created: DocumentRecord = {
-      id: `doc_${Math.random().toString(36).slice(2, 9)}`,
-      name: input.name,
-      fileType: extension,
-      sizeBytes: Math.round(400_000 + Math.random() * 6_000_000),
-      collectionId: input.collectionId,
-      collectionName: collection?.collectionName ?? "Unfiled",
-      owner: "Vishvendra Vadla",
-      department: "Executive",
-      classification: input.classification,
-      status: "processing",
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      pageCount: Math.round(4 + Math.random() * 60),
-      chunkCount: 0,
-      tags: [],
-    };
-    mockDocuments.unshift(created);
-    return created;
+    return mockCreateDocument(input.name, input.collectionId, input.classification);
   }
   return request<DocumentRecord>("/documents", { method: "POST", body: input });
+}
+
+export interface UploadDocumentFileInput {
+  file: File;
+  collectionId: string;
+  classification: Classification;
+  onProgress?: (fraction: number) => void;
+  signal?: AbortSignal;
+}
+
+/**
+ * Uploads real file bytes to `POST /documents/upload` (multipart), where the
+ * backend validates, stores, extracts, chunks, embeds and indexes the file
+ * before responding with the finished document. Failures reject with the
+ * server's own error message — nothing is fabricated client-side.
+ */
+export async function uploadDocumentFile(
+  input: UploadDocumentFileInput,
+): Promise<DocumentRecord> {
+  const { file, collectionId, classification, onProgress, signal } = input;
+
+  if (USE_MOCKS) {
+    // demo mode: simulate upload progress, then fabricate a document record
+    const steps = 8;
+    for (let step = 1; step <= steps; step += 1) {
+      await latency(80, 170);
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      onProgress?.(step / steps);
+    }
+    await latency(500, 1000); // "indexing"
+    return mockCreateDocument(file.name, collectionId, classification);
+  }
+
+  if (!isValidUuid(collectionId)) {
+    throw new Error("Select a valid collection before uploading.");
+  }
+
+  const formData = new FormData();
+  formData.append("file", file, file.name);
+  formData.append("collection_id", collectionId);
+  formData.append("classification", classification);
+
+  return uploadRequest<DocumentRecord>("/documents/upload", formData, { onProgress, signal });
 }
 
 export async function updateDocument(

@@ -65,7 +65,7 @@ export function CitationSource({
           <span className="truncate">{documentName}</span>
         </span>
         <span className="mt-0.5 block text-xs text-muted-foreground">
-          {collectionName} · Page {pageNumber}
+          {collectionName ? `${collectionName} · ` : ""}Page {pageNumber}
         </span>
         <span className="mt-1 line-clamp-2 block text-xs italic text-muted-foreground/80">
           “{quote}”

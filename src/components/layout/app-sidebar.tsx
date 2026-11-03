@@ -37,6 +37,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { logout as endSession } from "@/lib/api/auth";
 import { useAuthStore, useUIStore } from "@/stores/ui";
 
 function isActive(pathname: string, href: string): boolean {
@@ -57,6 +58,7 @@ export function AppSidebar() {
   }, [pathname]);
 
   const handleLogout = () => {
+    void endSession().catch(() => undefined); // best-effort: invalidate server session
     logout();
     router.replace("/login");
   };
@@ -180,6 +182,7 @@ function UserMenuButton({ collapsed }: { collapsed: boolean }) {
   const logout = useAuthStore((state) => state.logout);
 
   const handleLogout = () => {
+    void endSession().catch(() => undefined); // best-effort: invalidate server session
     logout();
     router.replace("/login");
   };

@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { FolderPlus } from "lucide-react";
+import { FolderPlus, Loader2 } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -20,6 +20,10 @@ import {
 } from "@/components/ui/select";
 import { UploadDropzone } from "@/components/documents/upload-dropzone";
 import { useCollections } from "@/lib/queries";
+import {
+  getCollectionReadiness,
+  type CollectionLoadState,
+} from "@/lib/upload-workflow";
 import type { Classification } from "@/lib/types";
 
 interface UploadDialogProps {
@@ -30,14 +34,32 @@ interface UploadDialogProps {
 
 export function UploadDialog({ open, onOpenChange, onUploaded }: UploadDialogProps) {
   const collections = useCollections();
-  const [collectionId, setCollectionId] = React.useState("col_hr");
+  const [collectionId, setCollectionId] = React.useState("");
   const [classification, setClassification] = React.useState<Classification>("internal");
 
+  const collectionsState: CollectionLoadState = collections.isPending
+    ? "loading"
+    : collections.isError
+      ? "error"
+      : "ready";
+  const collectionCount = collections.data?.length ?? 0;
+  const collectionReadiness = getCollectionReadiness({
+    state: collectionsState,
+    collectionCount,
+    collectionId,
+  });
+  const collectionSelectionDisabled =
+    collectionsState !== "ready" || collectionCount === 0;
+
   React.useEffect(() => {
-    if (open && collections.data?.length && collectionId === "col_hr") {
-      setCollectionId(collections.data[0]?.id ?? "col_hr");
+    if (
+      collections.isSuccess &&
+      collectionId &&
+      !collections.data.some((collection) => collection.id === collectionId)
+    ) {
+      setCollectionId("");
     }
-  }, [open, collections.data, collectionId]);
+  }, [collections.isSuccess, collections.data, collectionId]);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -52,7 +74,11 @@ export function UploadDialog({ open, onOpenChange, onUploaded }: UploadDialogPro
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-2">
             <Label htmlFor="upload-collection">Collection</Label>
-            <Select value={collectionId} onValueChange={setCollectionId}>
+            <Select
+              value={collectionId || undefined}
+              onValueChange={setCollectionId}
+              disabled={collectionSelectionDisabled}
+            >
               <SelectTrigger id="upload-collection" aria-label="Destination collection">
                 <SelectValue placeholder="Select a collection" />
               </SelectTrigger>
@@ -64,6 +90,49 @@ export function UploadDialog({ open, onOpenChange, onUploaded }: UploadDialogPro
                 ))}
               </SelectContent>
             </Select>
+
+            {collectionsState === "loading" ? (
+              <p
+                className="flex items-center gap-1.5 text-xs text-muted-foreground"
+                role="status"
+                aria-live="polite"
+              >
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                Loading collections…
+              </p>
+            ) : collectionsState === "error" ? (
+              <div className="space-y-1" role="alert">
+                <p className="text-xs text-destructive">
+                  {collections.error?.message || "Collections could not be loaded."}
+                </p>
+                <Button
+                  type="button"
+                  variant="link"
+                  size="sm"
+                  className="h-auto p-0 text-xs"
+                  onClick={() => void collections.refetch()}
+                >
+                  Retry loading collections
+                </Button>
+              </div>
+            ) : collectionReadiness.message ? (
+              <p
+                className={
+                  collectionReadiness.code === "invalid"
+                    ? "text-xs text-destructive"
+                    : "text-xs text-muted-foreground"
+                }
+                role={
+                  collectionReadiness.code === "empty" ||
+                  collectionReadiness.code === "invalid"
+                    ? "alert"
+                    : "status"
+                }
+                aria-live="polite"
+              >
+                {collectionReadiness.message}
+              </p>
+            ) : null}
           </div>
 
           <div className="space-y-2">
@@ -85,7 +154,13 @@ export function UploadDialog({ open, onOpenChange, onUploaded }: UploadDialogPro
           </div>
         </div>
 
-        <UploadDropzone onUploaded={onUploaded} />
+        <UploadDropzone
+          collectionId={collectionId}
+          collectionsState={collectionsState}
+          collectionCount={collectionCount}
+          classification={classification}
+          onUploaded={onUploaded}
+        />
 
         <div className="flex items-center justify-between gap-3 border-t pt-4">
           <p className="text-xs text-muted-foreground">
