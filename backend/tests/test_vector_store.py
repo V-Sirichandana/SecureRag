@@ -11,7 +11,11 @@ import uuid
 import pytest
 
 from app.services.ingestion.embeddings import HashingEmbeddingProvider
-from app.services.ingestion.vector_store import QdrantVectorStore, build_tenant_filter
+from app.services.ingestion.vector_store import (
+    QdrantVectorStore,
+    VectorDimensionMismatchError,
+    build_tenant_filter,
+)
 
 DIMENSION = 32
 
@@ -118,6 +122,35 @@ async def test_mismatched_vectors_and_payloads_rejected(store):
         await store.upsert_chunks(
             vectors=[[0.0] * DIMENSION], payloads=[], vector_size=DIMENSION
         )
+
+
+async def test_existing_collection_dimension_mismatch_is_rejected_without_changes(
+    store, embedder
+):
+    """A wrong EMBEDDING_DIM must fail closed, never recreate the collection."""
+    await index(store, embedder, "tenant-a", "doc-a", ["original retained text"])
+
+    with pytest.raises(VectorDimensionMismatchError) as excinfo:
+        await store.upsert_chunks(
+            vectors=[[0.0] * 16],
+            payloads=[
+                payload(
+                    tenant_id="tenant-a",
+                    document_id="doc-b",
+                    text="must never be written",
+                )
+            ],
+            vector_size=16,
+        )
+    assert excinfo.value.status_code == 503
+
+    info = store._client.get_collection("test_chunks")
+    assert info.config.params.vectors.size == DIMENSION
+    assert store._client.count(collection_name="test_chunks", exact=True).count == 1
+
+    query = await embedder.embed_query("original retained text")
+    results = await store.search(vector=query, tenant_id="tenant-a", top_k=5)
+    assert [result.document_id for result in results] == ["doc-a"]
 
 
 # --------------------------------------------------------------------- security

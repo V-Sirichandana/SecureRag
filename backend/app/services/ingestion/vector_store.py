@@ -12,14 +12,32 @@ Docker/managed Qdrant server.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 from qdrant_client import QdrantClient, models
 
-from app.core.exceptions import ServiceNotConfiguredError
+from app.core.exceptions import AppError, ServiceNotConfiguredError
 from app.services.rag.base import RetrievedChunk, VectorStore
 
 MEMORY_URL = ":memory:"
+logger = logging.getLogger("securerag.vector_store")
+
+
+class VectorDimensionMismatchError(AppError):
+    """Existing collection cannot accept vectors of the configured width.
+
+    This is a read-only guard: no collection is recreated, resized or deleted.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "VECTOR_DIMENSION_MISMATCH",
+            "The vector collection was created with a different embedding dimension. "
+            "Refusing to write into it; use a matching EMBEDDING_* configuration or "
+            "a new collection. Existing vectors were not modified.",
+            status_code=503,
+        )
 
 
 def _safe_metadata(payload: dict[str, Any]) -> dict[str, Any]:
@@ -91,6 +109,11 @@ class QdrantVectorStore:
             self._client = QdrantClient(url=url, api_key=api_key or None)
         self._ensured: set[int] = set()
         self._existing_checked = False
+
+    @property
+    def collection_name(self) -> str:
+        """Read-only collection binding (used by migration tooling)."""
+        return self._collection
 
     # ------------------------------------------------------------- indexing
     async def upsert_chunks(
@@ -188,8 +211,30 @@ class QdrantVectorStore:
                     size=vector_size, distance=models.Distance.COSINE
                 ),
             )
+        else:
+            existing_size = self._collection_vector_size()
+            if existing_size is not None and existing_size != vector_size:
+                logger.error(
+                    "Qdrant collection %s has vector dimension %s but the active "
+                    "embedder produces %s; refusing to write",
+                    self._collection,
+                    existing_size,
+                    vector_size,
+                )
+                raise VectorDimensionMismatchError()
         self._ensured.add(vector_size)
         self._existing_checked = True
+
+    def _collection_vector_size(self) -> int | None:
+        """Read the existing collection width without modifying it."""
+        info = self._client.get_collection(self._collection)
+        vectors = info.config.params.vectors
+        if isinstance(vectors, dict):
+            # Named-vector collections are not created by this application;
+            # never guess which vector a write should target.
+            return None
+        size = getattr(vectors, "size", None)
+        return int(size) if size is not None else None
 
     def _collection_exists(self) -> bool:
         if self._existing_checked:
@@ -198,6 +243,10 @@ class QdrantVectorStore:
         if exists:
             self._existing_checked = True
         return exists
+
+    def check_health(self) -> None:
+        """Read-only connectivity check used by the readiness probe."""
+        self._client.get_collections()
 
 
 class UnconfiguredVectorStore:
@@ -218,6 +267,11 @@ class UnconfiguredVectorStore:
 
     async def delete_document(self, *, tenant_id: str, document_id: str) -> None:
         return None
+
+    def check_health(self) -> None:
+        raise ServiceNotConfiguredError(
+            "SERVICE_NOT_CONFIGURED", "QDRANT_URL is not configured."
+        )
 
     async def search(
         self,

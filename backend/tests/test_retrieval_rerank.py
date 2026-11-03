@@ -6,14 +6,16 @@ passed the tenant filter AND the CURRENT database permission check.
 
 from __future__ import annotations
 
+import pytest
 import pytest_asyncio
 
 from app.core.config import Settings
+from app.core.exceptions import AppError
 from app.db.database import create_all, drop_all
 from app.main import create_app
 from app.services.ingestion.embeddings import HashingEmbeddingProvider
 from app.services.rag.base import RetrievedChunk
-from app.services.rag.retriever import TenantScopedRetriever
+from app.services.rag.retriever import MAX_CANDIDATES, TenantScopedRetriever
 from tests.conftest import create_collection
 from tests.test_retrieval import document_ids, retrieve, tenant_of, upload
 
@@ -265,6 +267,7 @@ async def test_candidate_fetch_respects_reranker_limits(app, actor_factory):
     assert store.fetches[0] == 20  # min(top_k * 3 = 30, RERANKER_MAX_CANDIDATES = 20)
     assert store.fetches == [20]  # enough authorized results in round 1
     assert len(results) == 10
+    assert len(recorder.calls[0]) == 20  # the pool is exactly the configured cap
 
 
 # ------------------------------------------------------- F: small result sets
@@ -340,3 +343,173 @@ async def test_unknown_reranker_provider_fails_safe(app, actor_factory):
     body = response.text.lower()
     assert "does-not-exist" in body  # controlled message names the provider
     assert "traceback" not in body
+
+
+# ------------------------------- M5.1 K: reranker output stays inside the pool
+def test_constrain_to_pool_drops_ids_outside_the_pool():
+    pool = [
+        RetrievedChunk(text="alpha", score=0.9, document_id="doc-1", chunk_id="a"),
+        RetrievedChunk(text="beta", score=0.8, document_id="doc-2", chunk_id="b"),
+    ]
+    rogue = RetrievedChunk(text="smuggled", score=0.1, document_id="doc-9", chunk_id="x")
+
+    final = TenantScopedRetriever._constrain_to_pool(pool, [rogue, pool[1], pool[0]])
+
+    assert [chunk.chunk_id for chunk in final] == ["b", "a"]
+    assert all(chunk.chunk_id != "x" for chunk in final)
+
+
+def test_constrain_to_pool_rejects_forged_payloads():
+    pool = [
+        RetrievedChunk(
+            text="authorized payload",
+            score=0.9,
+            document_id="doc-1",
+            chunk_id="a",
+            metadata={"chunk_index": 0},
+        )
+    ]
+    forged = RetrievedChunk(
+        text="attacker-controlled text",
+        score=0.99,
+        document_id="doc-attacker",
+        chunk_id="a",
+        metadata={"chunk_index": 999, "admin": True},
+        rerank_score=0.99,
+    )
+
+    final = TenantScopedRetriever._constrain_to_pool(pool, [forged])
+
+    assert len(final) == 1
+    survivor = final[0]
+    # payload fields come from the authorized pool copy, never from output
+    assert survivor.text == "authorized payload"
+    assert survivor.document_id == "doc-1"
+    assert survivor.metadata == {"chunk_index": 0}
+    assert survivor.score == 0.9
+    assert survivor.rerank_score == 0.99  # only rerank_score is taken from output
+
+
+def test_constrain_to_pool_duplicates_keep_first_occurrence():
+    pool = [
+        RetrievedChunk(text="alpha", score=0.9, document_id="doc-1", chunk_id="a"),
+        RetrievedChunk(text="beta", score=0.8, document_id="doc-2", chunk_id="b"),
+    ]
+
+    final = TenantScopedRetriever._constrain_to_pool(pool, [pool[1], pool[1], pool[0]])
+
+    assert [chunk.chunk_id for chunk in final] == ["b", "a"]
+
+
+def test_constrain_to_pool_rejects_non_list_output():
+    pool = [RetrievedChunk(text="alpha", score=0.9, document_id="doc-1", chunk_id="a")]
+
+    with pytest.raises(AppError) as excinfo:
+        TenantScopedRetriever._constrain_to_pool(pool, {"chunk_id": "a"})
+
+    assert excinfo.value.code == "SERVICE_UNAVAILABLE"
+    assert excinfo.value.status_code == 503
+
+
+async def test_non_list_reranker_output_returns_503(app, actor_factory, monkeypatch):
+    class MalformedReranker:
+        async def rerank(self, *, query: str, chunks, top_k: int = 5):
+            return {"chunks": list(chunks)}
+
+    owner_client, owner_session = await actor_factory(
+        name="Olivia Owner", email="olivia@acme.com", org="Acme Corp"
+    )
+    collection = await create_collection(owner_client, owner_session, name="Docs")
+    await upload(
+        owner_client,
+        owner_session,
+        collection_id=collection["id"],
+        filename="doc.txt",
+        content=b"Quarterly planning note.",
+    )
+    monkeypatch.setattr("app.services.rag.get_reranker", lambda settings: MalformedReranker())
+
+    response = await retrieve(owner_client, owner_session, query="quarterly planning")
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "SERVICE_UNAVAILABLE"
+    assert "traceback" not in response.text.lower()
+
+
+async def test_empty_reranker_output_is_not_refilled(app, actor_factory, monkeypatch):
+    owner_client, owner_session = await actor_factory(
+        name="Olivia Owner", email="olivia@acme.com", org="Acme Corp"
+    )
+    collection = await create_collection(owner_client, owner_session, name="Docs")
+    await upload(
+        owner_client,
+        owner_session,
+        collection_id=collection["id"],
+        filename="doc.txt",
+        content=b"Quarterly planning note.",
+    )
+
+    recorder = RecordingReranker(transform=lambda chunks: [])
+    monkeypatch.setattr("app.services.rag.get_reranker", lambda settings: recorder)
+
+    response = await retrieve(owner_client, owner_session, query="quarterly planning")
+    assert response.status_code == 200, response.text
+    assert recorder.calls, "the reranker must have been invoked"
+    assert recorder.calls[0], "the authorized pool was non-empty going in"
+    assert response.json() == [], "an empty reranker output is never refilled"
+
+
+# ------------------------------- M5.1 L: candidate cap (MAX_CANDIDATES = 40)
+def bare_retriever(**overrides) -> TenantScopedRetriever:
+    kwargs = {
+        "db": None,
+        "embedder": None,
+        "vector_store": None,
+        "reranker": RecordingReranker(),
+    }
+    kwargs.update(overrides)
+    return TenantScopedRetriever(**kwargs)
+
+
+def test_rerank_pool_limit_never_exceeds_max_candidates():
+    assert MAX_CANDIDATES == 40
+    assert bare_retriever()._rerank_pool_limit == MAX_CANDIDATES  # unset → hard cap
+    assert bare_retriever(rerank_max_candidates=100)._rerank_pool_limit == 40
+    assert bare_retriever(rerank_max_candidates=20)._rerank_pool_limit == 20
+    assert bare_retriever(rerank_max_candidates=0)._rerank_pool_limit == 1
+    assert bare_retriever(rerank_max_candidates=-5)._rerank_pool_limit == 1
+
+
+async def test_candidate_pool_capped_at_40_when_configured_higher(app, actor_factory):
+    owner_client, owner_session = await actor_factory(
+        name="Olivia Owner", email="olivia@acme.com", org="Acme Corp"
+    )
+    collection = await create_collection(owner_client, owner_session, name="Docs")
+    document = await upload(
+        owner_client,
+        owner_session,
+        collection_id=collection["id"],
+        filename="shared.txt",
+        content=b"Shared quarterly planning content.",
+    )
+
+    store = RecordingStore([chunks_for(document["id"], 100, prefix="cand")])
+    recorder = RecordingReranker()
+    async with app.state.session_factory() as db:
+        retriever = TenantScopedRetriever(
+            db=db,
+            embedder=HashingEmbeddingProvider(dimension=384),
+            vector_store=store,
+            reranker=recorder,
+            rerank_top_k=10,
+            rerank_max_candidates=100,  # configuration can never raise the cap
+        )
+        results = await retriever.retrieve(
+            query="planning content",
+            tenant_id=tenant_of(owner_session),
+            user_id=owner_session["user"]["id"],
+            top_k=20,
+        )
+
+    assert store.fetches == [40]  # fetch itself is bounded by MAX_CANDIDATES
+    assert len(recorder.calls[0]) == 40  # the reranker pool never exceeds 40
+    assert len(results) == 10  # rerank_top_k still bounds the final result

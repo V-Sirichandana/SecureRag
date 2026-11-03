@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib
+import os
 from collections.abc import Awaitable, Callable
 
 import pytest_asyncio
@@ -9,25 +11,45 @@ from httpx import ASGITransport, AsyncClient
 
 from app.core.config import Settings
 from app.db.database import create_all, drop_all
-from app.main import create_app
+
+_MODULE_APP_ENV = {
+    "DATABASE_URL": "sqlite+aiosqlite:///:memory:",
+    "QDRANT_URL": ":memory:",
+}
+_previous_module_env = {key: os.environ.get(key) for key in _MODULE_APP_ENV}
+os.environ.update(_MODULE_APP_ENV)
+try:
+    create_app = importlib.import_module("app.main").create_app
+finally:
+    for key, value in _previous_module_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 PASSWORD = "password123"
 
 
-def make_settings() -> Settings:
+def make_settings(*, storage_dir: str) -> Settings:
     return Settings(
+        _env_file=None,
         app_env="test",
         jwt_secret_key="test-secret-key-not-for-production",
         database_url="sqlite+aiosqlite:///:memory:",
         redis_url="",
+        qdrant_url=":memory:",
+        storage_dir=storage_dir,
         cors_origins="http://localhost:3000",
+        llm_provider="",
+        llm_api_key="",
+        llm_model="",
         debug=False,
     )
 
 
 @pytest_asyncio.fixture
-async def app():
-    application = create_app(make_settings())
+async def app(tmp_path):
+    application = create_app(make_settings(storage_dir=str(tmp_path / "uploads")))
     await create_all(application.state.engine)
     yield application
     await drop_all(application.state.engine)

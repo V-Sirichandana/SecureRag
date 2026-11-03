@@ -13,7 +13,6 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,12 +20,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings, get_settings
 from app.core.exceptions import AppError, NotFoundError
 from app.core.permissions import Role, role_at_least
-from app.models import Collection, Document, DocumentPermission, Membership, Tenant, User
+from app.models import (
+    Collection,
+    Document,
+    DocumentChunk,
+    DocumentPermission,
+    Membership,
+    Tenant,
+    User,
+)
 from app.repositories import CollectionRepository, DocumentRepository
 from app.schemas.document import (
     DocumentCreateIn,
     DocumentOut,
     DocumentPageOut,
+    DocumentParagraphOut,
     DocumentPermissionsIn,
     DocumentPermissionsOut,
     DocumentUpdateIn,
@@ -41,6 +49,7 @@ from app.services.ingestion.processor import (
 from app.services.ingestion.vector_store import UnconfiguredVectorStore
 from app.services.rag import get_lexical_index
 from app.services.rag.base import LexicalIndex, VectorStore
+from app.services.storage import Storage, StorageError, build_storage
 
 logger = logging.getLogger("securerag.ingestion")
 
@@ -76,6 +85,7 @@ class DocumentService:
         settings: Settings | None = None,
         vector_store: VectorStore | None = None,
         lexical_index: LexicalIndex | None = None,
+        storage: Storage | None = None,
     ) -> None:
         self.db = db
         self.repository = DocumentRepository(db)
@@ -86,6 +96,8 @@ class DocumentService:
         # the lexical index without route changes (factory falls back to the
         # explicit null index only when no session exists)
         self.lexical_index = lexical_index or get_lexical_index(self.settings, db)
+        # local by default; S3 is optional and reported on use when incomplete
+        self.storage = storage or build_storage(self.settings)
 
     # ---------------------------------------------------------------- helpers
     async def _permissions(self, document_id: uuid.UUID) -> list[DocumentPermission]:
@@ -288,7 +300,9 @@ class DocumentService:
             # global grant: everyone in the tenant may read this document
             self.db.add(DocumentPermission(document_id=document.id))
 
-        document.storage_path = self._store_file(tenant.id, document, file_name, content)
+        document.storage_path = await self._store_file(
+            tenant.id, document, file_name, content
+        )
 
         await self.audit.log(
             user=user,
@@ -356,7 +370,9 @@ class DocumentService:
         document.file_type = (file_extension(file_name) or "txt")[:16]
         document.file_size = len(content)
         document.status = "processing"
-        document.storage_path = self._store_file(tenant.id, document, file_name, content)
+        document.storage_path = await self._store_file(
+            tenant.id, document, file_name, content
+        )
 
         await self.audit.log(
             user=user,
@@ -493,18 +509,23 @@ class DocumentService:
             return "everyone"
         return "restricted"
 
-    def _store_file(
+    async def _store_file(
         self, tenant_id: uuid.UUID, document: Document, file_name: str, content: bytes
     ) -> str | None:
-        """Persist raw bytes under a server-generated path (never client paths)."""
+        """Persist raw bytes under a server-generated tenant-scoped key.
+
+        Operational storage failures are non-fatal (the document can still be
+        ingested from the bytes in hand) but configuration errors propagate so
+        an incompletely configured backend fails the upload cleanly.
+        """
         try:
-            directory = Path(self.settings.storage_dir) / str(tenant_id)
-            directory.mkdir(parents=True, exist_ok=True)
-            suffix = file_extension(file_name)
-            target = directory / f"{document.id}{f'.{suffix}' if suffix else ''}"
-            target.write_bytes(content)
-            return str(target)
-        except OSError:
+            return await self.storage.save(
+                tenant_id=tenant_id,
+                document_id=document.id,
+                file_name=file_name,
+                content=content,
+            )
+        except StorageError:
             logger.warning("Could not persist upload for document %s", document.id)
             return None
 
@@ -521,8 +542,8 @@ class DocumentService:
         if not document.storage_path:
             return
         try:
-            Path(document.storage_path).unlink(missing_ok=True)
-        except OSError:
+            await self.storage.delete(document.storage_path)
+        except StorageError:
             logger.warning("Could not remove stored file for document %s", document.id)
 
     async def update_document(
@@ -709,10 +730,54 @@ class DocumentService:
     async def document_pages(
         self, *, tenant: Tenant, user: User, role: Role, document_id: uuid.UUID
     ) -> list[DocumentPageOut]:
+        """Page preview backed by the text extracted at ingest time.
+
+        The ingestion pipeline stores every chunk with its page number, so an
+        ingested document serves its REAL paragraphs here. Authorization runs
+        through ``get_document`` first and the chunk query is tenant-scoped —
+        the preview can never read outside the caller's tenant. Documents that
+        were only created as metadata (no bytes ingested yet) have no extracted
+        text and keep the structural placeholder page list.
+        """
         document, _, _, _ = await self.get_document(
             tenant=tenant, user=user, role=role, document_id=document_id
         )
-        # Placeholder until the ingestion pipeline stores extracted text.
+        rows = (
+            await self.db.execute(
+                select(
+                    DocumentChunk.page,
+                    DocumentChunk.chunk_index,
+                    DocumentChunk.chunk_id,
+                    DocumentChunk.text,
+                )
+                .where(
+                    DocumentChunk.tenant_id == tenant.id,
+                    DocumentChunk.document_id == document.id,
+                )
+                .order_by(DocumentChunk.page, DocumentChunk.chunk_index)
+            )
+        ).all()
+
+        grouped: dict[int, list[tuple[str, str]]] = {}
+        for page, _chunk_index, chunk_id, text in rows:
+            grouped.setdefault(int(page), []).append((str(chunk_id), text))
+
+        if grouped:
+            page_numbers = sorted(grouped)
+            single = len(page_numbers) == 1
+            return [
+                DocumentPageOut(
+                    page_number=page,
+                    title=document.name if single else f"{document.name} — page {page}",
+                    paragraphs=[
+                        DocumentParagraphOut(id=chunk_id, text=text)
+                        for chunk_id, text in grouped[page]
+                    ],
+                )
+                for page in page_numbers
+            ]
+
+        # metadata-only document — no extracted text yet, keep the page list
         page_count = max(document.page_count, 1)
         return [
             DocumentPageOut(

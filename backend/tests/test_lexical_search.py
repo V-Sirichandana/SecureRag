@@ -24,6 +24,7 @@ What is under test:
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
@@ -693,6 +694,30 @@ async def test_retrieve_lexical_with_null_index_returns_nothing(app, actor_facto
     assert results == []
 
 
+async def test_retrieve_lexical_failure_is_safe_503_without_reranking(
+    app, actor_factory, monkeypatch
+):
+    async def exploding_search(self, **kwargs):
+        raise RuntimeError("fts backend exploded with password=sk-LEX-LEAK")
+
+    monkeypatch.setattr(SqlLexicalIndex, "search", exploding_search)
+    client, session = await actor_factory(name="Ada", email="ada@example.com", org="Acme")
+    recorder = RecordingReranker()
+
+    async with app.state.session_factory() as db:
+        with pytest.raises(AppError) as excinfo:
+            await lexical_retriever(db, reranker=recorder).retrieve_lexical(
+                query="findable keywords",
+                tenant_id=tenant_of(session),
+                user_id=session["user"]["id"],
+            )
+
+    assert excinfo.value.code == "SERVICE_UNAVAILABLE"
+    assert excinfo.value.status_code == 503
+    assert "sk-lex-leak" not in excinfo.value.message.lower()
+    assert recorder.calls == [], "no partial/unauthorized candidates may reach the reranker"
+
+
 # ------------------------------------------- PostgreSQL branch (construction)
 def test_postgres_statement_shape_matches_migration_expression():
     sql = postgres_search_statement(0)
@@ -736,12 +761,13 @@ class _FakeDb:
 
     sync_session = type("S", (), {"no_autoflush": _NoAutoflush()})()
 
-    def __init__(self):
+    def __init__(self, rows=None):
         self.calls: list[tuple[str, dict]] = []
+        self.rows = list(rows or [])
 
     async def execute(self, statement, params=None):
         self.calls.append((str(statement), params))
-        return _FakeResult([])
+        return _FakeResult(self.rows)
 
 
 async def test_postgres_branch_binds_values_never_sql_text(monkeypatch):
@@ -774,6 +800,62 @@ async def test_postgres_branch_binds_values_never_sql_text(monkeypatch):
     }
     # no bound value leaks into the SQL text itself
     assert tenant not in sql and col_a not in sql and col_b not in sql
+
+
+async def test_postgres_branch_maps_rows_and_preserves_rank_order(monkeypatch):
+    """No live server: validate the PostgreSQL branch's result mapping offline."""
+    tenant = str(uuid.uuid4())
+    collection = str(uuid.uuid4())
+    document = str(uuid.uuid4())
+    rows = [
+        SimpleNamespace(
+            chunk_id="pg-chunk-1",
+            document_id=document,
+            collection_id=collection,
+            page=2,
+            filename="handbook.txt",
+            text="first ranked passage about leave policy",
+            chunk_index=4,
+            score=0.75,
+        ),
+        SimpleNamespace(
+            chunk_id="pg-chunk-2",
+            document_id=document,
+            collection_id=collection,
+            page=1,
+            filename="handbook.txt",
+            text="second ranked passage about leave policy",
+            chunk_index=1,
+            score=0.25,
+        ),
+    ]
+    fake = _FakeDb(rows)
+    monkeypatch.setattr(
+        SqlLexicalIndex, "_dialect", property(lambda self: "postgresql")
+    )
+
+    results = await SqlLexicalIndex(fake).search(
+        query="leave policy",
+        tenant_id=tenant,
+        collection_ids=[collection],
+        top_k=2,
+    )
+
+    assert [chunk.chunk_id for chunk in results] == ["pg-chunk-1", "pg-chunk-2"]
+    assert [chunk.score for chunk in results] == [0.75, 0.25]
+    first = results[0]
+    assert first.document_id == document
+    assert first.collection_id == collection
+    assert first.page_number == 2
+    assert first.filename == "handbook.txt"
+    assert first.quote == "first ranked passage about leave policy"
+    assert first.metadata == {"chunk_index": 4}
+    sql, params = fake.calls[0]
+    assert "websearch_to_tsquery" in sql
+    assert params["query"] == "leave policy"
+    assert params["tenant_id"] == tenant
+    assert params["fetch"] == 2
+    assert params["c0"] == collection
 
 
 async def test_unknown_engine_fails_closed(app, actor_factory, monkeypatch):

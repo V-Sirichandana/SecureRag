@@ -1,0 +1,3 @@
+# Optional S3-compatible object storage for STORAGE_PROVIDER=s3.
+# Local filesystem storage (the default) does not need this package.
+boto3>=1.34

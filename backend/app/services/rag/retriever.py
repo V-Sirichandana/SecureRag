@@ -31,8 +31,10 @@ configuration, never client-selectable)::
           + lexical candidates (server tenant fence)
           → deduplicate by chunk_id
           → ONE CURRENT permission check over the union
+          → recompute source ranks over the AUTHORIZED set only
           → RRF fusion over AUTHORIZED candidates only
-          → existing reranker pool cap → reranker → final top-k
+          → hard candidate cap → existing reranker
+          → reranker output ∩ authorized pool → final top-k
 
 Vector mode keeps the flow above byte-identical: ``score`` is the original
 vector similarity. In hybrid mode ``score`` becomes the fused Reciprocal
@@ -100,16 +102,23 @@ def _union_candidates(
     vector_results: list[RetrievedChunk],
     lexical_results: list[RetrievedChunk],
 ) -> list[_FusedCandidate]:
-    """Deduplicate both sources by ``chunk_id``, retaining private source ranks.
+    """Deduplicate both sources by ``chunk_id``, retaining private source order.
 
     The vector-sourced chunk is the carrier when a chunk appears in both
     sources (its raw similarity is preserved in ``vector_score``);
-    lexical-only chunks carry their lexical ``RetrievedChunk``. Ranks are
-    1-based positions captured at fetch time — BEFORE authorization — so
-    dropping unauthorized candidates later never renumber them.
+    lexical-only chunks carry their lexical ``RetrievedChunk``. The stored
+    ranks are 1-based FETCH positions — they only encode relative source
+    order. Before any RRF fusion they must be renumbered over the
+    authorized set (:func:`_recompute_source_ranks`) so hidden candidates
+    can never influence a visible candidate's score.
     """
     union: dict[str, _FusedCandidate] = {}
     for rank, chunk in enumerate(vector_results, start=1):
+        # A well-behaved store returns each chunk once, but if a provider ever
+        # duplicates an id, keep its FIRST (best) rank instead of letting a
+        # later duplicate overwrite it.
+        if chunk.chunk_id in union:
+            continue
         union[chunk.chunk_id] = _FusedCandidate(
             chunk=chunk, vector_rank=rank, vector_score=chunk.score
         )
@@ -119,20 +128,60 @@ def _union_candidates(
             union[chunk.chunk_id] = _FusedCandidate(
                 chunk=chunk, lexical_rank=rank, lexical_score=chunk.score
             )
-        else:
+        elif existing.lexical_rank is None:
+            # Cross-source duplicate: attach lexical provenance to the vector
+            # carrier. If the lexical source itself repeats an id, first wins.
             existing.lexical_rank = rank
             existing.lexical_score = chunk.score
     return list(union.values())
 
 
+def _recompute_source_ranks(candidates: list[_FusedCandidate]) -> list[_FusedCandidate]:
+    """Renumber each source's ranks densely over the AUTHORIZED candidates only.
+
+    Called between the single authorization check and RRF fusion so the
+    fused score depends only on what the caller is allowed to see: a hidden
+    candidate removed by authorization never shifts a visible candidate's
+    rank (visible B behind hidden X scores as authorized rank 2, not fetch
+    rank 3), which closes the rank side-channel. Relative source order —
+    the original fetch ordering — is preserved; candidates absent from a
+    source keep ``None``. Returns new instances; inputs are never mutated.
+    """
+    vector_order = sorted(
+        (candidate for candidate in candidates if candidate.vector_rank is not None),
+        key=lambda candidate: candidate.vector_rank,
+    )
+    lexical_order = sorted(
+        (candidate for candidate in candidates if candidate.lexical_rank is not None),
+        key=lambda candidate: candidate.lexical_rank,
+    )
+    vector_rank = {
+        candidate.chunk.chunk_id: rank for rank, candidate in enumerate(vector_order, start=1)
+    }
+    lexical_rank = {
+        candidate.chunk.chunk_id: rank for rank, candidate in enumerate(lexical_order, start=1)
+    }
+    return [
+        replace(
+            candidate,
+            vector_rank=vector_rank.get(candidate.chunk.chunk_id),
+            lexical_rank=lexical_rank.get(candidate.chunk.chunk_id),
+        )
+        for candidate in candidates
+    ]
+
+
 def _rrf_fuse(candidates: list[_FusedCandidate]) -> list[_FusedCandidate]:
-    """Reciprocal Rank Fusion over already-authorized candidates.
+    """Reciprocal Rank Fusion from the candidates' per-source ranks.
 
     ``fused_score = Σ 1 / (RRF_K + rank)`` across the sources where the
     candidate appears; raw vector/lexical scores never enter the formula.
-    Ordering is fully deterministic: fused score DESC, then vector rank ASC
-    (missing = +inf), then lexical rank ASC (missing = +inf), then
-    ``chunk_id`` ASC. Returns new instances — inputs are never mutated.
+    In the hybrid pipeline the ranks are authorization-relative (see
+    :func:`_recompute_source_ranks`), so the score reflects only the
+    candidates the caller may see. Ordering is fully deterministic: fused
+    score DESC, then vector rank ASC (missing = +inf), then lexical rank
+    ASC (missing = +inf), then ``chunk_id`` ASC. Returns new instances —
+    inputs are never mutated.
     """
     fused: list[_FusedCandidate] = []
     for candidate in candidates:
@@ -401,10 +450,12 @@ class TenantScopedRetriever:
         authorized = [
             candidate for candidate in union if candidate.chunk.document_id in visible
         ]
-        # ONLY authorized candidates are fused — unauthorized chunks never
-        # receive a fused score, never enter the ordering, never reach the
-        # reranker
-        fused = _rrf_fuse(authorized)
+        # M-2: ranks are recomputed OVER THE AUTHORIZED SET before fusion, so
+        # a hidden candidate can never influence a visible candidate's fused
+        # score (no rank side-channel). ONLY authorized candidates are fused —
+        # unauthorized chunks never receive a fused score, never enter the
+        # ordering, never reach the reranker
+        fused = _rrf_fuse(_recompute_source_ranks(authorized))
         chunks = [replace(candidate.chunk, score=candidate.fused_score) for candidate in fused]
         # the existing _rerank applies _rerank_pool_limit (40) and top_k;
         # rerank_score behavior is unchanged
@@ -501,9 +552,17 @@ class TenantScopedRetriever:
 
     @property
     def _rerank_pool_limit(self) -> int:
+        """Effective reranker pool cap: config may LOWER it, never raise it.
+
+        ``RERANKER_MAX_CANDIDATES`` is runtime configuration, so it is
+        clamped against the hard server-side maximum (``MAX_CANDIDATES``) —
+        no configuration can grow the pool above 40. Non-positive values
+        (only reachable through direct construction; Settings enforces
+        ``ge=1``) stay floored at 1, preserving the existing convention.
+        """
         if self.rerank_max_candidates is None:
             return MAX_CANDIDATES
-        return max(self.rerank_max_candidates, 1)
+        return min(max(self.rerank_max_candidates, 1), MAX_CANDIDATES)
 
     async def _rerank(
         self, *, query: str, chunks: list[RetrievedChunk], top_k: int
@@ -511,21 +570,63 @@ class TenantScopedRetriever:
         """Re-order already-authorized chunks and cut to the final result count.
 
         ``chunks`` arrive exclusively from the tenant + permission filter
-        above; the reranker is never consulted for visibility. The final count
-        never exceeds what the caller requested, and the vector ``score`` of
-        every chunk survives untouched (``rerank_score`` carries the new one).
+        above; the reranker is never consulted for visibility. Its output is
+        then intersected with the authorized pool it was given
+        (:meth:`_constrain_to_pool`) — a reranker may REORDER authorized
+        candidates but can never introduce one. The final count never
+        exceeds what the caller requested, and the vector ``score`` of every
+        chunk survives untouched (``rerank_score`` carries the new one).
         """
         if self.reranker is None:
             return chunks[:top_k]
         pool = chunks[: self._rerank_pool_limit]
         final_k = min(top_k, self.rerank_top_k)
         try:
-            return await self.reranker.rerank(query=query, chunks=pool, top_k=final_k)
+            reranked = await self.reranker.rerank(query=query, chunks=pool, top_k=final_k)
+            # bounded by min(top_k, rerank_top_k) even if the provider over-returns
+            return self._constrain_to_pool(pool, reranked)[:final_k]
         except AppError:
             raise  # SERVICE_NOT_CONFIGURED / VALIDATION keep their status
         except Exception as exc:  # noqa: BLE001 - never leak reranker internals
             logger.exception("Reranking failed")
             raise AppError("SERVICE_UNAVAILABLE") from exc
+
+    @staticmethod
+    def _constrain_to_pool(
+        pool: list[RetrievedChunk], reranked: object
+    ) -> list[RetrievedChunk]:
+        """Reranker-output authorization boundary (integrity check only).
+
+        Keeps only reranker results whose ``chunk_id`` belongs to the
+        authorized pool the reranker was handed, in the reranker's order —
+        first occurrence wins, duplicates and unknown/malformed entries are
+        dropped, and results are never refilled. Payload fields come from
+        the pool copy (only ``rerank_score`` is taken from the output), so
+        even a rogue provider cannot smuggle altered content past the
+        authorized set. No second database query happens here: this checks
+        identity against an already-authorized pool.
+        """
+        if not isinstance(reranked, list):
+            raise AppError(
+                "SERVICE_UNAVAILABLE", "The reranker returned an unexpected result."
+            )
+        authorized: dict[str, RetrievedChunk] = {}
+        for chunk in pool:
+            authorized.setdefault(chunk.chunk_id, chunk)
+        final: list[RetrievedChunk] = []
+        seen: set[str] = set()
+        for candidate in reranked:
+            chunk_id = getattr(candidate, "chunk_id", None)
+            if not isinstance(chunk_id, str) or chunk_id not in authorized:
+                continue  # unknown / malformed entry — never introduced
+            if chunk_id in seen:
+                continue  # duplicate — first occurrence wins
+            seen.add(chunk_id)
+            source = authorized[chunk_id]
+            final.append(
+                replace(source, rerank_score=getattr(candidate, "rerank_score", None))
+            )
+        return final
 
     async def _vector_search(
         self,

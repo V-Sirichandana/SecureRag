@@ -41,10 +41,11 @@ from app.services.rag.retriever import (
     RRF_K,
     TenantScopedRetriever,
     _FusedCandidate,
+    _recompute_source_ranks,
     _rrf_fuse,
     _union_candidates,
 )
-from tests.conftest import auth, create_collection
+from tests.conftest import auth, create_collection, create_document
 from tests.test_retrieval import document_ids, retrieve, tenant_of, upload
 from tests.test_retrieval_rerank import ExplodingReranker, RecordingReranker
 from tests.test_retrieval_response import EXPECTED_FIELDS
@@ -428,6 +429,32 @@ def test_deduplication_by_chunk_id_retains_both_source_ranks():
     assert not hasattr(dup.chunk, "lexical_rank")
 
 
+def test_duplicate_ids_within_one_source_keep_the_first_rank():
+    """A repeated id must never downgrade its own source rank."""
+    vector = [
+        make_chunk("dup-v", score=0.9, text="best vector occurrence"),
+        make_chunk("dup-v", score=0.1, text="later duplicate"),
+        make_chunk("v-only", score=0.8),
+    ]
+    lexical = [
+        make_chunk("dup-l", score=9.0),
+        make_chunk("dup-l", score=1.0),
+        make_chunk("l-only", score=2.0),
+    ]
+
+    by_id = {
+        candidate.chunk.chunk_id: candidate
+        for candidate in _union_candidates(vector, lexical)
+    }
+    assert set(by_id) == {"dup-v", "v-only", "dup-l", "l-only"}
+    assert by_id["dup-v"].vector_rank == 1
+    assert by_id["dup-v"].vector_score == 0.9
+    assert by_id["dup-v"].chunk is vector[0]
+    assert by_id["dup-l"].lexical_rank == 1
+    assert by_id["dup-l"].lexical_score == 9.0
+    assert by_id["dup-l"].chunk is lexical[0]
+
+
 # ------------------------------------------ 9: tenant isolation
 async def test_hybrid_tenant_isolation(app, actor_factory):
     client_a, session_a = await actor_factory(
@@ -773,11 +800,14 @@ async def test_hybrid_vector_failure_returns_503(app, actor_factory, monkeypatch
             raise NotImplementedError
 
     monkeypatch.setattr(app.state, "vector_store", ExplodingStore())
+    recorder = RecordingReranker()
+    monkeypatch.setattr("app.services.rag.get_reranker", lambda settings: recorder)
 
     client, session = await actor_factory(name="Fail", email="fail@example.com", org="Ops")
     response = await retrieve(client, session, query="anything")
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "SERVICE_UNAVAILABLE"
+    assert recorder.calls == [], "a failed source must not reach the reranker"
     body = response.text.lower()
     assert "sk-leak" not in body
     assert "127.0.0.1" not in body
@@ -790,11 +820,14 @@ async def test_hybrid_lexical_failure_returns_503(app, actor_factory, monkeypatc
         raise RuntimeError("postgres exploded with password=sk-DB-LEAK")
 
     monkeypatch.setattr(SqlLexicalIndex, "search", exploding_lexical)
+    recorder = RecordingReranker()
+    monkeypatch.setattr("app.services.rag.get_reranker", lambda settings: recorder)
 
     client, session = await actor_factory(name="Fail", email="fail2@example.com", org="Ops")
     response = await retrieve(client, session, query="anything")
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "SERVICE_UNAVAILABLE"
+    assert recorder.calls == [], "a failed source must not reach the reranker"
     body = response.text.lower()
     assert "sk-db-leak" not in body
     assert "traceback" not in body
@@ -1103,3 +1136,170 @@ async def test_hybrid_responses_are_deterministic(app, actor_factory):
     second_ids = [hit["chunkId"] for hit in second.json()]
     assert first_ids == second_ids
     assert [hit["score"] for hit in first.json()] == [hit["score"] for hit in second.json()]
+
+
+# ------------------------- 31: hidden candidate never shifts visible ranks (M-2)
+async def test_hidden_candidate_never_shifts_visible_rank_scores(
+    app, actor_factory, monkeypatch
+):
+    """Ranks come from the AUTHORIZED set, never from the raw fetch order."""
+    owner_client, owner_session = await actor_factory(
+        name="Olivia Owner", email="olivia@acme.com", org="Acme Corp"
+    )
+    member_client, member_session = await actor_factory(
+        name="Mia Member",
+        email="mia@acme.com",
+        invited_by=(owner_client, owner_session),
+        role="member",
+    )
+    collection = await create_collection(owner_client, owner_session, name="Archive")
+    doc_a = await create_document(
+        owner_client,
+        owner_session,
+        collection_id=collection["id"],
+        name="Quokka Field Notes.pdf",
+        classification="internal",
+    )
+    doc_x = await create_document(
+        owner_client,
+        owner_session,
+        collection_id=collection["id"],
+        name="Quokka Confidential Dossier.pdf",
+        classification="confidential",
+    )
+    doc_b = await create_document(
+        owner_client,
+        owner_session,
+        collection_id=collection["id"],
+        name="Quokka Summary.pdf",
+        classification="internal",
+    )
+
+    async def scripted_vector(**kwargs):
+        return [
+            make_chunk("vec-a", document_id=doc_a["id"], text="field notes"),
+            make_chunk("vec-x", document_id=doc_x["id"], text="confidential dossier"),
+            make_chunk("vec-b", document_id=doc_b["id"], text="summary"),
+        ]
+
+    async def no_lexical(self, **kwargs):
+        return []
+
+    monkeypatch.setattr(app.state.vector_store, "search", scripted_vector)
+    monkeypatch.setattr(SqlLexicalIndex, "search", no_lexical)
+
+    member_response = await retrieve(member_client, member_session, query="quokka archive")
+    assert member_response.status_code == 200, member_response.text
+    member_scores = {hit["documentId"]: hit["score"] for hit in member_response.json()}
+    # doc_x (fetch rank 2) is hidden from the member: doc_b sits at
+    # AUTHORIZED rank 2, so its score is 1/62 — never the fetch-rank
+    # side-channel 1/63 that would reveal how many hidden rows precede it
+    assert set(member_scores) == {doc_a["id"], doc_b["id"]}
+    assert member_scores[doc_a["id"]] == pytest.approx(1 / (RRF_K + 1))
+    assert member_scores[doc_b["id"]] == pytest.approx(1 / (RRF_K + 2))
+
+    owner_response = await retrieve(owner_client, owner_session, query="quokka archive")
+    assert owner_response.status_code == 200, owner_response.text
+    owner_scores = {hit["documentId"]: hit["score"] for hit in owner_response.json()}
+    # the owner may see doc_x, so doc_b legitimately sits at rank 3
+    assert set(owner_scores) == {doc_a["id"], doc_x["id"], doc_b["id"]}
+    assert owner_scores[doc_a["id"]] == pytest.approx(1 / (RRF_K + 1))
+    assert owner_scores[doc_x["id"]] == pytest.approx(1 / (RRF_K + 2))
+    assert owner_scores[doc_b["id"]] == pytest.approx(1 / (RRF_K + 3))
+
+
+# ------------------------- 32: ranks recomputed over authorized set only (M-2)
+def test_hidden_candidate_removed_before_rank_computation():
+    vector = [
+        make_chunk("hidden", document_id="doc-hidden"),
+        make_chunk("a1", document_id="doc-a"),
+        make_chunk("a2", document_id="doc-a"),
+    ]
+    union = _union_candidates(vector, [])
+    authorized = [candidate for candidate in union if candidate.chunk.chunk_id != "hidden"]
+
+    fused = _rrf_fuse(_recompute_source_ranks(authorized))
+    scores = {candidate.chunk.chunk_id: candidate.fused_score for candidate in fused}
+    assert scores["a1"] == pytest.approx(1 / (RRF_K + 1))
+    assert scores["a2"] == pytest.approx(1 / (RRF_K + 2))
+
+    # the stored fetch ranks still encode the hidden candidate — fusing them
+    # WITHOUT the recompute would expose 1/62 for a1 instead of 1/61
+    leaky = _rrf_fuse(authorized)
+    leaky_scores = {candidate.chunk.chunk_id: candidate.fused_score for candidate in leaky}
+    assert leaky_scores["a1"] == pytest.approx(1 / (RRF_K + 2))
+    assert scores["a1"] != pytest.approx(leaky_scores["a1"])
+
+
+# ---------------- 33: recompute is independent across sources (M-2)
+def test_rank_recompute_is_independent_of_hidden_cross_source_candidates():
+    vector = [make_chunk("h-vec"), make_chunk("vis-1"), make_chunk("vis-2")]
+    lexical = [make_chunk("h-lex"), make_chunk("vis-2"), make_chunk("vis-1")]
+    hidden = {"h-vec", "h-lex"}
+
+    union = _union_candidates(vector, lexical)
+    authorized = [candidate for candidate in union if candidate.chunk.chunk_id not in hidden]
+    with_hidden = _rrf_fuse(_recompute_source_ranks(authorized))
+
+    visible_only = _rrf_fuse(
+        _recompute_source_ranks(
+            _union_candidates(
+                [chunk for chunk in vector if chunk.chunk_id not in hidden],
+                [chunk for chunk in lexical if chunk.chunk_id not in hidden],
+            )
+        )
+    )
+
+    # a hidden candidate in either source never moves the visible candidates
+    assert [(c.chunk.chunk_id, c.fused_score) for c in with_hidden] == [
+        (c.chunk.chunk_id, c.fused_score) for c in visible_only
+    ]
+    scores = {candidate.chunk.chunk_id: candidate.fused_score for candidate in with_hidden}
+    assert scores["vis-1"] == pytest.approx(1 / (RRF_K + 1) + 1 / (RRF_K + 2))
+    assert scores["vis-2"] == pytest.approx(1 / (RRF_K + 2) + 1 / (RRF_K + 1))
+
+
+# ------------------------- 34: recompute never mutates its input (M-2)
+def test_recompute_returns_new_instances_and_preserves_inputs():
+    vector = [make_chunk("hidden"), make_chunk("v1"), make_chunk("v2")]
+    lexical = [make_chunk("v2"), make_chunk("l1")]
+    union = _union_candidates(vector, lexical)
+    snapshot = [(c.chunk.chunk_id, c.vector_rank, c.lexical_rank) for c in union]
+
+    authorized = [candidate for candidate in union if candidate.chunk.chunk_id != "hidden"]
+    recomputed = _recompute_source_ranks(authorized)
+
+    assert all(
+        new is not old
+        for new, old in zip(recomputed, authorized, strict=True)
+    )
+    assert [(c.chunk.chunk_id, c.vector_rank, c.lexical_rank) for c in union] == snapshot
+    assert [c.chunk.chunk_id for c in recomputed] == [c.chunk.chunk_id for c in authorized]
+
+    by_id = {candidate.chunk.chunk_id: candidate for candidate in recomputed}
+    # dense renumbering over the authorized set: v1 was fetch rank 2 → rank 1
+    assert by_id["v1"].vector_rank == 1
+    assert by_id["v1"].lexical_rank is None
+    assert by_id["v2"].vector_rank == 2
+    assert by_id["v2"].lexical_rank == 1
+    # sources the candidate never appeared in stay None
+    assert by_id["l1"].vector_rank is None
+    assert by_id["l1"].lexical_rank == 2
+
+
+# ------------------------- 35: recompute + fusion stay deterministic (M-2)
+def test_rank_recompute_and_fusion_are_deterministic():
+    vector = [make_chunk(f"v{index}") for index in range(4)]
+    lexical = [make_chunk(f"l{index}") for index in range(4)]
+
+    def run() -> list[tuple[str, float]]:
+        union = _union_candidates(vector, lexical)
+        authorized = [candidate for candidate in union if candidate.chunk.chunk_id != "v0"]
+        fused = _rrf_fuse(_recompute_source_ranks(authorized))
+        return [(candidate.chunk.chunk_id, candidate.fused_score) for candidate in fused]
+
+    first = run()
+    second = run()
+    assert first == second
+    assert len(first) == 7  # 8 deduplicated candidates minus the hidden one
+    assert dict(first)["v1"] == pytest.approx(1 / (RRF_K + 1))

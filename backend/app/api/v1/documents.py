@@ -13,6 +13,7 @@ from app.core.dependencies import (
     CurrentTenant,
     CurrentUser,
     DbSession,
+    StorageDep,
     VectorStoreDep,
     client_context,
     require_permission,
@@ -112,12 +113,15 @@ async def upload_document(
     db: DbSession,
     settings: AppSettings,
     vector_store: VectorStoreDep,
+    storage: StorageDep,
     classification: Annotated[ClassificationLiteral, Form()] = "internal",
 ) -> DocumentOut:
     ip_address, user_agent = client_context(request)
     # bounded read: never buffer more than the configured limit
     content = await file.read(settings.max_upload_bytes + 1)
-    return await DocumentService(db, settings=settings, vector_store=vector_store).upload_document(
+    return await DocumentService(
+        db, settings=settings, vector_store=vector_store, storage=storage
+    ).upload_document(
         tenant=tenant,
         user=user,
         collection_id=collection_id,
@@ -146,11 +150,12 @@ async def upload_document_content(
     db: DbSession,
     settings: AppSettings,
     vector_store: VectorStoreDep,
+    storage: StorageDep,
 ) -> DocumentOut:
     ip_address, user_agent = client_context(request)
     content = await file.read(settings.max_upload_bytes + 1)
     return await DocumentService(
-        db, settings=settings, vector_store=vector_store
+        db, settings=settings, vector_store=vector_store, storage=storage
     ).reingest_document(
         tenant=tenant,
         user=user,
@@ -217,9 +222,12 @@ async def delete_document(
     membership: CurrentMembership,
     db: DbSession,
     vector_store: VectorStoreDep,
+    storage: StorageDep,
 ) -> Response:
     ip_address, user_agent = client_context(request)
-    await DocumentService(db, vector_store=vector_store).delete_document(
+    await DocumentService(
+        db, vector_store=vector_store, storage=storage
+    ).delete_document(
         tenant=tenant,
         user=user,
         role=membership.role,
