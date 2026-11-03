@@ -42,9 +42,10 @@ def get_embedding_service(settings: Settings) -> EmbeddingService:
     if provider == "hashing":
         return HashingEmbeddingProvider(dimension=settings.embedding_dim)
     if provider == "fastembed":
-        return FastEmbedEmbeddingProvider(
-            model=settings.embedding_model, dimension=settings.embedding_dim
-        )
+        # Model metadata is verified inside the provider before any download;
+        # a missing dependency, unknown model or EMBEDDING_DIM mismatch is a
+        # clear SERVICE_NOT_CONFIGURED (501), never a hashing fallback.
+        return FastEmbedEmbeddingProvider.from_settings(settings)
     raise ServiceNotConfiguredError(
         "SERVICE_NOT_CONFIGURED",
         f"Embedding provider '{settings.embedding_provider}' is unknown. "
@@ -116,10 +117,11 @@ def get_retriever(
 def get_reranker(settings: Settings) -> Reranker:
     """Build the configured reranker.
 
-    Importing the provider module self-registers it in ``_RERANKERS``. The
-    provider name follows ``RERANKER_PROVIDER`` once configuration lands;
-    until then the offline ``heuristic`` provider is the default, and any
-    provider without an implementation keeps raising SERVICE_NOT_CONFIGURED.
+    Importing the provider module self-registers the ``heuristic`` and
+    ``fastembed`` providers in ``_RERANKERS``. Providers that need settings
+    expose a ``from_settings`` classmethod (the neural provider does); the
+    heuristic provider stays zero-argument. An unknown ``RERANKER_PROVIDER``
+    raises SERVICE_NOT_CONFIGURED (501) — there is no silent fallback.
     """
     from app.services.rag import reranker
 
@@ -130,6 +132,9 @@ def get_reranker(settings: Settings) -> Reranker:
             "SERVICE_NOT_CONFIGURED",
             f"Reranker provider '{name}' has no implementation yet.",
         )
+    builder = getattr(provider, "from_settings", None)
+    if callable(builder):
+        return builder(settings)
     return provider()
 
 
@@ -160,9 +165,18 @@ def get_lexical_index(settings: Settings, db=None) -> LexicalIndex:
 
 
 def get_llm_provider(settings: Settings) -> LLMProvider:
+    """Build the configured answer provider.
+
+    Importing the provider module self-registers it in ``_LLM_PROVIDERS``.
+    An unset ``LLM_PROVIDER`` or a provider without an implementation raises
+    SERVICE_NOT_CONFIGURED (501) — there is no silent fallback, so a request
+    that asks for real generation never receives a substitute answer.
+    """
+    from app.services.rag import llm  # noqa: F401 - registers the openai provider
+
     if not settings.llm_provider:
         raise ServiceNotConfiguredError("SERVICE_NOT_CONFIGURED", "LLM_PROVIDER is not set.")
-    provider = _LLM_PROVIDERS.get(settings.llm_provider.lower())
+    provider = _LLM_PROVIDERS.get(settings.llm_provider.strip().lower())
     if provider is None:
         raise ServiceNotConfiguredError(
             "SERVICE_NOT_CONFIGURED",

@@ -11,6 +11,7 @@ The alias is hidden from the OpenAPI schema to keep /docs clean.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 
@@ -27,6 +28,7 @@ from app.db.database import create_engine_and_factory
 from app.middleware.request_context import RequestContextMiddleware
 from app.services.rag import build_vector_store
 from app.services.rate_limit import LoginRateLimiter
+from app.services.storage import build_storage
 
 logger = logging.getLogger("securerag.app")
 
@@ -72,6 +74,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "Tokens will not survive a restart."
         )
 
+    if settings.is_production and not settings.cookie_secure:
+        logger.warning(
+            "COOKIE_SECURE is false while APP_ENV=production; session cookies "
+            "will be sent over plain HTTP. Set COOKIE_SECURE=true behind HTTPS."
+        )
+
     configure_logging(settings)
 
     engine, session_factory = create_engine_and_factory(
@@ -94,6 +102,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # one vector store per app instance (per-tenant isolation is enforced in
     # the store itself, never by client input) — never raises at startup
     app.state.vector_store = build_vector_store(settings)
+    # private document bytes: local by default, optional S3-compatible backend
+    app.state.storage = build_storage(settings)
 
     install_exception_handlers(app)
 
@@ -114,7 +124,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/health/ready", tags=["Health"], summary="Readiness probe")
     async def ready() -> JSONResponse:
-        checks: dict[str, str] = {"database": "ok", "redis": "disabled"}
+        checks: dict[str, str] = {
+            "database": "ok",
+            "redis": "disabled",
+            "qdrant": "disabled",
+        }
         try:
             async with engine.connect() as conn:
                 await conn.execute(text("SELECT 1"))
@@ -136,7 +150,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 logger.warning("Redis readiness check failed")
                 checks["redis"] = "error"
 
-        healthy = checks["database"] == "ok"
+        if settings.qdrant_url:
+            checks["qdrant"] = "ok"
+            try:
+                await asyncio.to_thread(app.state.vector_store.check_health)
+            except Exception:  # noqa: BLE001 - readiness must never crash
+                logger.warning("Qdrant readiness check failed")
+                checks["qdrant"] = "error"
+
+        healthy = checks["database"] == "ok" and checks["qdrant"] != "error"
         return JSONResponse(
             status_code=200 if healthy else 503,
             content={"status": "ready" if healthy else "degraded", "checks": checks},

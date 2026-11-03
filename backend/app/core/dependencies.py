@@ -29,6 +29,7 @@ from app.core.security import ACCESS_TOKEN_TYPE, decode_token
 from app.models import Membership, Tenant, User
 from app.repositories import UserRepository
 from app.services.rag.base import VectorStore
+from app.services.storage import Storage
 
 ACCESS_COOKIE = "sr_access_token"
 REFRESH_COOKIE = "sr_refresh_token"
@@ -71,9 +72,15 @@ def get_app_vector_store(request: Request) -> VectorStore:
     return request.app.state.vector_store
 
 
+def get_app_storage(request: Request) -> Storage:
+    """Private document byte storage bound to this app instance."""
+    return request.app.state.storage
+
+
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 AppSettings = Annotated[Settings, Depends(get_app_settings)]
 VectorStoreDep = Annotated[VectorStore, Depends(get_app_vector_store)]
+StorageDep = Annotated[Storage, Depends(get_app_storage)]
 
 
 # ---------------------------------------------------------------------- tokens

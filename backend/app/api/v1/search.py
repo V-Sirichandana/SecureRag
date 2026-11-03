@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 
 from app.core.dependencies import (
     AppSettings,
+    CurrentMembership,
     CurrentTenant,
     CurrentUser,
     DbSession,
@@ -23,13 +24,29 @@ from app.services.search_service import SearchService
 search_router = APIRouter(prefix="/search", tags=["Search"])
 
 
-@search_router.get("", response_model=list[SearchResultOut], summary="Search the organization")
+@search_router.get(
+    "",
+    response_model=list[SearchResultOut],
+    summary="Search the organization",
+    dependencies=[Depends(require_permission("view_documents"))],
+)
 async def search(
+    request: Request,
     tenant: CurrentTenant,
+    user: CurrentUser,
+    membership: CurrentMembership,
     db: DbSession,
     q: Annotated[str, Query(min_length=1, max_length=200)] = "",
 ) -> list[SearchResultOut]:
-    return await SearchService(db).search(tenant=tenant, query=q)
+    """Document search behind the retrieval authorization boundary.
+
+    Rate-limited per authenticated user (server-derived identity — the
+    tenant header/cookies cannot move the bucket) BEFORE any query work.
+    """
+    await request.app.state.rate_limiter.check(str(user.id), scope="search")
+    return await SearchService(db).search(
+        tenant=tenant, user=user, role=membership.role, query=q
+    )
 
 
 def _out(chunk: RetrievedChunk) -> RetrievedChunkOut:
@@ -54,6 +71,7 @@ def _out(chunk: RetrievedChunk) -> RetrievedChunkOut:
 )
 async def retrieve(
     payload: RetrieveIn,
+    request: Request,
     tenant: CurrentTenant,
     user: CurrentUser,
     db: DbSession,
@@ -66,8 +84,11 @@ async def retrieve(
     visibility is checked against CURRENT permissions in the database on
     every request. The request body cannot influence either. The retrieval
     mode (vector/hybrid) and the meaning of ``score`` are server-side
-    configuration — the request body cannot select them.
+    configuration — the request body cannot select them. The rate limit is
+    keyed by the authenticated user id and applied before any retrieval
+    work starts.
     """
+    await request.app.state.rate_limiter.check(str(user.id), scope="search")
     retriever = get_retriever(settings, db=db, vector_store=vector_store)
     chunks = await retriever.retrieve(
         query=payload.query,

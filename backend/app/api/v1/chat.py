@@ -7,9 +7,11 @@ from uuid import UUID
 from fastapi import APIRouter, Request, Response, status
 
 from app.core.dependencies import (
+    AppSettings,
     CurrentTenant,
     CurrentUser,
     DbSession,
+    VectorStoreDep,
     client_context,
 )
 from app.schemas.chat import (
@@ -87,7 +89,7 @@ async def delete_conversation(
     "/conversations/{conversation_id}/messages",
     response_model=ChatMessageOut,
     status_code=201,
-    summary="Persist a message (audit: QUERY)",
+    summary="Ask a question / persist a message (audit: QUERY)",
 )
 async def persist_message(
     conversation_id: UUID,
@@ -96,9 +98,24 @@ async def persist_message(
     tenant: CurrentTenant,
     user: CurrentUser,
     db: DbSession,
+    settings: AppSettings,
+    vector_store: VectorStoreDep,
 ) -> ChatMessageOut:
+    """Question flow (``role="user"``): retrieve authorized chunks, generate a
+    grounded answer through the configured provider, attach citations built
+    from those chunks and persist the user message, the assistant message and
+    the QUERY audit event together. The generated assistant message is
+    returned; ``role="assistant"`` keeps the plain persistence behaviour.
+
+    Tenant, user and document permissions are derived from the authenticated
+    principal — the body cannot supply them. Generation requests are
+    rate-limited under the same per-user retrieval bucket (scope ``search``)
+    BEFORE any retrieval or provider work, mirroring ``POST /search/retrieve``.
+    """
+    if payload.role == "user":
+        await request.app.state.rate_limiter.check(str(user.id), scope="search")
     ip_address, user_agent = client_context(request)
-    return await ChatService(db).persist_message(
+    return await ChatService(db, settings=settings, vector_store=vector_store).persist_message(
         tenant=tenant,
         user=user,
         conversation_id=conversation_id,

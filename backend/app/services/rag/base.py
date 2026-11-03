@@ -187,5 +187,15 @@ class LLMProvider(Protocol):
         context: list[RetrievedChunk],
         max_tokens: int = 1024,
     ) -> GenerationResult:
-        """Produce a grounded answer with citations from retrieved context."""
+        """Produce a grounded answer from ``context`` and ``prompt``.
+
+        Contract: ``context`` arrives already bounded and ordered by the
+        caller, and the rendered prompt numbers the passages ``[1]..[n]`` in
+        exactly that list order so ``[n]`` markers in the answer can be mapped
+        back to these chunks. Providers return answer text only — the
+        ``citations`` field of the result is never authoritative metadata;
+        callers rebuild citations from ``context`` themselves (see
+        ``app.services.rag.answer``), so generated text can never invent
+        document ids, pages or other citation fields.
+        """
         ...

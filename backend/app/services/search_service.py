@@ -1,11 +1,19 @@
-"""Global search across documents, collections and users (tenant-scoped)."""
+"""Global search across documents, collections and users (tenant-scoped).
+
+Documents are additionally fenced by the SAME document-authorization
+boundary as retrieval: non-admin callers only receive documents they are
+allowed to view (``DocumentRepository.visibility_clause`` — the rule behind
+``DocumentService._can_view``); ADMIN+ keeps full tenant-wide results.
+"""
 
 from __future__ import annotations
 
 from sqlalchemy import or_, select
 
 from app.core.exceptions import AppError
+from app.core.permissions import Role, role_at_least
 from app.models import Collection, Document, Membership, Tenant, User
+from app.repositories import DocumentRepository
 from app.schemas.settings import SearchResultOut
 
 
@@ -13,7 +21,15 @@ class SearchService:
     def __init__(self, db) -> None:
         self.db = db
 
-    async def search(self, *, tenant: Tenant, query: str, limit: int = 5) -> list[SearchResultOut]:
+    async def search(
+        self,
+        *,
+        tenant: Tenant,
+        user: User,
+        role: Role,
+        query: str,
+        limit: int = 5,
+    ) -> list[SearchResultOut]:
         q = query.strip()
         if not q:
             return []
@@ -23,13 +39,22 @@ class SearchService:
         pattern = f"%{q}%"
         results: list[SearchResultOut] = []
 
+        # server-derived identity only: non-admins see exactly the documents
+        # they are authorized to view (same predicate as retrieval)
+        visibility = None
+        if not role_at_least(role, Role.ADMIN):
+            visibility = (user.id, role.value)
+
+        doc_query = (
+            select(Document, Collection.name)
+            .outerjoin(Collection, Document.collection_id == Collection.id)
+            .where(Document.tenant_id == tenant.id, Document.name.ilike(pattern))
+        )
+        if visibility is not None:
+            doc_query = doc_query.where(DocumentRepository.visibility_clause(*visibility))
         doc_rows = (
             await self.db.execute(
-                select(Document, Collection.name)
-                .outerjoin(Collection, Document.collection_id == Collection.id)
-                .where(Document.tenant_id == tenant.id, Document.name.ilike(pattern))
-                .order_by(Document.created_at.desc())
-                .limit(5)
+                doc_query.order_by(Document.created_at.desc()).limit(5)
             )
         ).all()
         for document, collection_name in doc_rows:
@@ -52,11 +77,12 @@ class SearchService:
             )
         ).scalars().all()
         for collection in collections:
-            count = (
-                await self.db.execute(
-                    select(Document.id).where(Document.collection_id == collection.id)
+            count_query = select(Document.id).where(Document.collection_id == collection.id)
+            if visibility is not None:
+                count_query = count_query.where(
+                    DocumentRepository.visibility_clause(*visibility)
                 )
-            ).all()
+            count = (await self.db.execute(count_query)).all()
             results.append(
                 SearchResultOut(
                     id=str(collection.id),
@@ -78,12 +104,12 @@ class SearchService:
                 .limit(4)
             )
         ).scalars().all()
-        for user in users:
+        for member in users:
             results.append(
                 SearchResultOut(
-                    id=str(user.id),
-                    title=user.name,
-                    subtitle=user.email,
+                    id=str(member.id),
+                    title=member.name,
+                    subtitle=member.email,
                     type="user",
                     href="/app/users",
                 )
