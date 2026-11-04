@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from sqlalchemy import event
-from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -20,7 +19,6 @@ _SQLITE_KWARGS: dict = {"poolclass": StaticPool, "connect_args": {"check_same_th
 _ASYNC_POOL_KWARGS: dict = {"poolclass": AsyncAdaptedQueuePool, "pool_pre_ping": True}
 
 
-@event.listens_for(Engine, "connect")
 def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
     """SQLite does not enforce foreign keys by default — turn them on."""
     if not hasattr(dbapi_connection, "cursor"):
@@ -42,6 +40,9 @@ def create_engine_and_factory(
         kwargs.update(_ASYNC_POOL_KWARGS)
 
     engine = create_async_engine(database_url, **kwargs)
+    if database_url.startswith("sqlite"):
+        # Register per engine: this must never run on PostgreSQL connections.
+        event.listen(engine.sync_engine, "connect", _enable_sqlite_foreign_keys)
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     return engine, factory
 
