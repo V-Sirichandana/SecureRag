@@ -29,6 +29,17 @@ class ForgotPasswordIn(APIModel):
     email: EmailStr
 
 
+class ForgotPasswordOut(APIModel):
+    ok: bool = True
+    # Only populated when DEBUG is enabled — never in production.
+    reset_token: str | None = None
+
+
+class ResetPasswordIn(APIModel):
+    token: str = Field(min_length=20, max_length=4096)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
 class AcceptInviteIn(APIModel):
     """Payload for POST /auth/accept-invite (sent from the invitation link)."""
 

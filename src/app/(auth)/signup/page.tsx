@@ -15,7 +15,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { PasswordInput } from "@/components/auth/password-input";
 import { PasswordStrength } from "@/components/auth/password-strength";
 import { OAuthButtons } from "@/components/auth/oauth-buttons";
-import { oauthSignIn, signup } from "@/lib/api/auth";
+import { signup } from "@/lib/api/auth";
 import { useAuthStore, useUIStore } from "@/stores/ui";
 import { toast } from "sonner";
 
@@ -45,7 +45,7 @@ type SignupForm = z.infer<typeof signupSchema>;
 export default function SignupPage() {
   const router = useRouter();
   const [serverError, setServerError] = React.useState<string | null>(null);
-  const [oauthPending, setOauthPending] = React.useState<"google" | "microsoft" | null>(null);
+  const [oauthPending, setOauthPending] = React.useState<"google" | "github" | null>(null);
   const authLogin = useAuthStore((state) => state.login);
 
   const form = useForm<SignupForm>({
@@ -84,18 +84,10 @@ export default function SignupPage() {
     }
   };
 
-  const onOauth = async (provider: "google" | "microsoft") => {
+  const onOauth = (provider: "google" | "github") => {
     setOauthPending(provider);
-    try {
-      const session = await oauthSignIn(provider);
-      authLogin(session.user, session.organizations);
-      useUIStore.getState().setActiveOrganization(session.user.organizationId);
-      router.replace("/app/dashboard");
-    } catch (error) {
-      setServerError(error instanceof Error ? error.message : "SSO sign-in failed.");
-    } finally {
-      setOauthPending(null);
-    }
+    const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+    window.location.href = `${apiUrl}/api/v1/auth/oauth/${provider}`;
   };
 
   const fieldError = (name: keyof SignupForm) =>

@@ -26,20 +26,17 @@ function GoogleMark() {
   );
 }
 
-function MicrosoftMark() {
+function GitHubMark() {
   return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className="h-4 w-4">
-      <path fill="#F25022" d="M2 2h9.5v9.5H2z" />
-      <path fill="#7FBA00" d="M12.5 2H22v9.5h-9.5z" />
-      <path fill="#00A4EF" d="M2 12.5h9.5V22H2z" />
-      <path fill="#FFB900" d="M12.5 12.5H22V22h-9.5z" />
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="h-4 w-4" fill="currentColor">
+      <path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.2.8-.5v-1.9c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.6-1.3-1.6-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.8 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.7 18.3 5 18.3 5c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.5-2.7 5.5-5.3 5.8.4.4.8 1.1.8 2.2v3.3c0 .3.2.6.8.5 4.6-1.5 7.9-5.8 7.9-10.9C23.5 5.7 18.3.5 12 .5Z" />
     </svg>
   );
 }
 
 interface OAuthButtonsProps {
-  onSelect: (provider: "google" | "microsoft") => void;
-  pending: "google" | "microsoft" | null;
+  onSelect: (provider: "google" | "github") => void;
+  pending: "google" | "github" | null;
 }
 
 export function OAuthButtons({ onSelect, pending }: OAuthButtonsProps) {
@@ -71,15 +68,15 @@ export function OAuthButtons({ onSelect, pending }: OAuthButtonsProps) {
           type="button"
           variant="outline"
           className="h-10"
-          onClick={() => onSelect("microsoft")}
+          onClick={() => onSelect("github")}
           disabled={pending !== null}
         >
-          {pending === "microsoft" ? (
+          {pending === "github" ? (
             <span className="mr-2 h-4 w-4 animate-spin rounded-full border-2 border-muted-foreground border-t-transparent" />
           ) : (
-            <MicrosoftMark />
+            <GitHubMark />
           )}
-          Microsoft
+          GitHub
         </Button>
       </div>
     </div>

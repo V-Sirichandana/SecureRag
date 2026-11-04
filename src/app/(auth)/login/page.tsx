@@ -14,7 +14,7 @@ import { Label } from "@/components/ui/label";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { PasswordInput } from "@/components/auth/password-input";
 import { OAuthButtons } from "@/components/auth/oauth-buttons";
-import { login, oauthSignIn } from "@/lib/api/auth";
+import { login } from "@/lib/api/auth";
 import { useAuthStore, useUIStore } from "@/stores/ui";
 import { toast } from "sonner";
 
@@ -29,7 +29,7 @@ type LoginForm = z.infer<typeof loginSchema>;
 export default function LoginPage() {
   const router = useRouter();
   const [serverError, setServerError] = React.useState<string | null>(null);
-  const [oauthPending, setOauthPending] = React.useState<"google" | "microsoft" | null>(null);
+  const [oauthPending, setOauthPending] = React.useState<"google" | "github" | null>(null);
   const authLogin = useAuthStore((state) => state.login);
 
   const form = useForm<LoginForm>({
@@ -54,20 +54,13 @@ export default function LoginPage() {
     }
   };
 
-  const onOauth = async (provider: "google" | "microsoft") => {
+  const onOauth = (provider: "google" | "github") => {
     setServerError(null);
     setOauthPending(provider);
-    try {
-      const session = await oauthSignIn(provider);
-      authLogin(session.user, session.organizations);
-      useUIStore.getState().setActiveOrganization(session.user.organizationId);
-      toast.success("Signed in with SSO.");
-      router.replace("/app/dashboard");
-    } catch (error) {
-      setServerError(error instanceof Error ? error.message : "SSO sign-in failed.");
-    } finally {
-      setOauthPending(null);
-    }
+    // Redirect the browser to the backend OAuth start endpoint, which redirects
+    // to the provider and ultimately back to /app/dashboard with a session.
+    const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+    window.location.href = `${apiUrl}/api/v1/auth/oauth/${provider}`;
   };
 
   return (

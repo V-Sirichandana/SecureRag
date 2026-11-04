@@ -91,12 +91,42 @@ export async function requestPasswordReset(email: string): Promise<{ ok: true }>
   return request("/auth/forgot-password", { method: "POST", body: { email } });
 }
 
+export async function resetPassword(token: string, newPassword: string): Promise<{ ok: true }> {
+  if (USE_MOCKS) {
+    await latency(600, 1000);
+    return { ok: true };
+  }
+  return request("/auth/reset-password", { method: "POST", body: { token, new_password: newPassword } });
+}
+
 export async function logout(): Promise<void> {
   if (USE_MOCKS) {
     await latency(200, 400);
     return;
   }
   await request("/auth/logout", { method: "POST" });
+}
+
+export async function getMe(): Promise<AuthSession> {
+  if (USE_MOCKS) {
+    await latency(200, 400);
+    return sessionFor("Vishvendra Vadla", "vishvendra@acmetech.io");
+  }
+  const raw = (await request("/auth/me", { method: "GET" })) as {
+    user: { id: string; name: string; email: string; role: AuthSession["user"]["role"]; department: string; organizationId: string };
+    organizations?: AuthSession["organizations"];
+  };
+  return {
+    user: {
+      id: raw.user.id,
+      name: raw.user.name,
+      email: raw.user.email,
+      role: raw.user.role,
+      department: raw.user.department,
+      organizationId: raw.user.organizationId,
+    },
+    organizations: raw.organizations ?? [],
+  };
 }
 
 export async function oauthSignIn(provider: "google" | "microsoft"): Promise<AuthSession> {

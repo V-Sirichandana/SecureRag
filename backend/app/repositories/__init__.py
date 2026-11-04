@@ -51,6 +51,12 @@ class UserRepository:
         result = await self.db.execute(select(User).where(User.email == email.lower()))
         return result.scalar_one_or_none()
 
+    async def get_by_password_reset_token_hash(self, token_hash: str) -> User | None:
+        result = await self.db.execute(
+            select(User).where(User.password_reset_token_hash == token_hash)
+        )
+        return result.scalar_one_or_none()
+
     async def add(self, user: User) -> User:
         self.db.add(user)
         await self.db.flush()

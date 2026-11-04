@@ -49,10 +49,26 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = Field(default=30, ge=1)
     refresh_token_expire_days: int = Field(default=14, ge=1)
+    password_reset_token_expire_minutes: int = Field(default=30, ge=5, le=1440)
+    # Optional SMTP for password-reset email delivery (free; user provides server).
+    smtp_host: str = ""
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_username: str = ""
+    smtp_password: str = Field(default="", repr=False)
+    smtp_from: str = ""
+    smtp_use_tls: bool = True
 
     # cookies
     cookie_secure: bool = False
     cookie_samesite: str = "lax"
+    frontend_url: str = ""
+    # OAuth (optional; leave blank to disable)
+    google_client_id: str = ""
+    google_client_secret: str = Field(default="", repr=False)
+    google_redirect_uri: str = ""
+    github_client_id: str = ""
+    github_client_secret: str = Field(default="", repr=False)
+    github_redirect_uri: str = ""
 
     # cors
     cors_origins: str = "http://localhost:3000"

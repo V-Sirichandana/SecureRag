@@ -24,6 +24,13 @@ class User(Base, UUIDPk, TimestampMixin):
     status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)
     department: Mapped[str | None] = mapped_column(String(100), nullable=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Password reset (single-use, expiring). Only a hash of the token is stored.
+    password_reset_token_hash: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, index=True
+    )
+    password_reset_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class Membership(Base, UUIDPk, CreatedAtMixin):

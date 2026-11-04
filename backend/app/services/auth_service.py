@@ -6,9 +6,13 @@ built exclusively from the memberships stored in the database.
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import re
 import secrets
-from datetime import UTC, datetime
+import smtplib
+from datetime import UTC, datetime, timedelta
+from email.message import EmailMessage
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -303,3 +307,122 @@ async def logout(
         user_agent=user_agent,
     )
     await db.commit()
+
+
+async def request_password_reset(
+    db: AsyncSession,
+    settings: Settings,
+    email: str,
+    *,
+    ip_address: str | None = None,
+) -> str | None:
+    """Mint a single-use, expiring reset token for the account (if it exists).
+
+    Always performs the same work regardless of whether the email is known so
+    timing does not reveal account existence. Returns the raw token when an
+    account exists (caller is responsible for delivering it) and None otherwise.
+    The stored value is only a hash, so a DB leak cannot be used to reset.
+    """
+    users = UserRepository(db)
+    user = await users.get_by_email(email)
+    if user is None:
+        # Keep timing roughly consistent.
+        hash_password(secrets.token_urlsafe(24))
+        return None
+
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    user.password_reset_token_hash = token_hash
+    user.password_reset_expires_at = datetime.now(UTC) + timedelta(
+        minutes=settings.password_reset_token_expire_minutes
+    )
+    await db.commit()
+    return raw_token
+
+
+async def reset_password(
+    db: AsyncSession,
+    settings: Settings,
+    token: str,
+    new_password: str,
+    *,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> None:
+    """Consume a reset token and set a new password.
+
+    Single-use: the token is cleared on success. Expired or unknown tokens
+    raise AUTH_TOKEN_INVALID (mapped to a generic message by the caller).
+    """
+    users = UserRepository(db)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    user = await users.get_by_password_reset_token_hash(token_hash)
+    if user is None:
+        raise AppError("AUTH_TOKEN_INVALID", "Reset link is invalid or has expired.")
+    expires = user.password_reset_expires_at
+    if expires is not None and expires.tzinfo is None:
+        expires = expires.replace(tzinfo=UTC)
+    if expires is None or expires < datetime.now(UTC):
+        # clear expired token
+        user.password_reset_token_hash = None
+        user.password_reset_expires_at = None
+        await db.commit()
+        raise AppError("AUTH_TOKEN_EXPIRED", "Reset link has expired.")
+    if not user.is_active:
+        raise AppError("ACCOUNT_DISABLED")
+
+    user.password_hash = hash_password(new_password)
+    user.password_reset_token_hash = None
+    user.password_reset_expires_at = None
+    user.last_login_at = datetime.now(UTC)
+    await db.commit()
+
+
+async def deliver_password_reset_email(settings: Settings, email: str, token: str) -> None:
+    """Send the reset link if SMTP is configured; otherwise log a warning.
+
+    No paid service is required — the operator supplies their own SMTP server.
+    """
+    logger = logging.getLogger("securerag.auth")
+    if not settings.smtp_host or not settings.smtp_from:
+        logger.warning(
+            "Password reset requested for %s but SMTP is not configured; "
+            "reset token not delivered via email.",
+            email,
+        )
+        return
+    frontend_url = getattr(settings, "frontend_url", "")
+    reset_url = (
+        f"{frontend_url.rstrip('/')}/reset-password?token={token}"
+        if frontend_url
+        else None
+    )
+    body = (
+        "You requested a password reset for your SecureRAG account.\n\n"
+        + (
+            f"Open this link to set a new password: {reset_url}\n\n"
+            if reset_url
+            else f"Your reset token is: {token}\n\n"
+        )
+        + f"This link expires in {settings.password_reset_token_expire_minutes} "
+        "minutes. If you did not request this, you can ignore this email."
+    )
+    msg = EmailMessage()
+    msg["Subject"] = "SecureRAG password reset"
+    msg["From"] = settings.smtp_from
+    msg["To"] = email
+    msg.set_content(body)
+    try:
+        if settings.smtp_use_tls:
+            with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=20) as server:
+                server.starttls()
+                if settings.smtp_username:
+                    server.login(settings.smtp_username, settings.smtp_password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=20) as server:
+                if settings.smtp_username:
+                    server.login(settings.smtp_username, settings.smtp_password)
+                server.send_message(msg)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to send password reset email to %s: %s", email, type(exc).__name__)
