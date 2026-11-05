@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   BookOpen,
   ChevronsLeft,
@@ -49,6 +50,7 @@ export function AppSidebar() {
   const pathname = usePathname();
   const router = useRouter();
   const { state, toggleSidebar, isMobile } = useSidebar();
+  const queryClient = useQueryClient();
   const user = useAuthStore((state) => state.user);
   const logout = useAuthStore((state) => state.logout);
   const collapsed = state === "collapsed" && !isMobile;
@@ -59,6 +61,7 @@ export function AppSidebar() {
 
   const handleLogout = () => {
     void endSession().catch(() => undefined); // best-effort: invalidate server session
+    queryClient.clear(); // drop cached user-scoped data before switching accounts
     logout();
     router.replace("/login");
   };
@@ -180,9 +183,11 @@ function UserMenuButton({ collapsed }: { collapsed: boolean }) {
   const user = useAuthStore((state) => state.user);
   const router = useRouter();
   const logout = useAuthStore((state) => state.logout);
+  const queryClient = useQueryClient();
 
   const handleLogout = () => {
     void endSession().catch(() => undefined); // best-effort: invalidate server session
+    queryClient.clear(); // drop cached user-scoped data before switching accounts
     logout();
     router.replace("/login");
   };

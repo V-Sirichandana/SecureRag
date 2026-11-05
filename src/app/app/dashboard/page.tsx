@@ -26,17 +26,12 @@ import { ErrorState } from "@/components/common/error-state";
 import { SecurityIndicator } from "@/components/common/security-indicators";
 import { useCollections, useDashboard } from "@/lib/queries";
 import { DEMO_NOTICE } from "@/lib/mock/utils";
-import { formatNumber, timeAgo } from "@/lib/utils";
-
-function greeting() {
-  const hour = new Date().getHours();
-  if (hour < 12) return "Good morning";
-  if (hour < 18) return "Good afternoon";
-  return "Good evening";
-}
+import { formatNumber, greetingFor, greetingName, timeAgo } from "@/lib/utils";
+import { useAuthStore } from "@/stores/ui";
 
 export default function DashboardPage() {
   const router = useRouter();
+  const user = useAuthStore((state) => state.user);
   const { data, isPending, isError, refetch } = useDashboard();
   const collections = useCollections();
 
@@ -55,7 +50,7 @@ export default function DashboardPage() {
   return (
     <div className="mx-auto w-full max-w-[1500px] space-y-6 p-4 sm:p-6 lg:p-8">
       <PageHeader
-        title={`${greeting()}, ${"Vishvendra"}`}
+        title={`${greetingFor()}, ${greetingName(user?.name)}`}
         description="Here's what's happening across your organization's knowledge base."
         actions={
           <>

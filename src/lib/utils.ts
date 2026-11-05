@@ -78,6 +78,20 @@ export function initials(name: string): string {
     .join("");
 }
 
+export function greetingFor(date: Date = new Date()): string {
+  const hour = date.getHours();
+  if (hour < 12) return "Good morning";
+  if (hour < 18) return "Good afternoon";
+  return "Good evening";
+}
+
+export function greetingName(name: string | null | undefined): string {
+  const trimmed = name?.trim();
+  if (!trimmed) return "there";
+  const firstName = trimmed.split(/\s+/)[0];
+  return firstName || "there";
+}
+
 export function maskApiKey(prefix: string): string {
   return `${prefix}${"•".repeat(16)}`;
 }
