@@ -1,0 +1,26 @@
+.env
+.env.*
+!.env.example
+!.env.production.example
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# tests / tooling
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# local databases / runtime
+*.db
+*.sqlite3
+*.log
+
+# ingestion file storage
+data/

@@ -1,0 +1,6 @@
+# Optional local models for EMBEDDING_PROVIDER=fastembed and
+# RERANKER_PROVIDER=fastembed. Install with:
+#   pip install -r requirements-fastembed.txt
+# Cross-encoder reranking requires fastembed>=0.4.2 (TextCrossEncoder).
+-r requirements.txt
+fastembed>=0.4.2
